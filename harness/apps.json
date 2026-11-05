@@ -1,0 +1,52 @@
+{
+  "agents-sandbox-coding-agent": {
+    "workerDir": ".",
+    "about": "",
+    "build": "npx vite build",
+    "test": "npx tsc --noEmit",
+    "typecheck": "npx tsc --noEmit",
+    "request": "/",
+    "scanNote": "",
+    "smoke": [
+      "/",
+      "/agents/coding-orchestrator/smoke",
+      "/agents/coding-orchestrator/smoke/get-messages",
+      "/agents/nope/smoke"
+    ]
+  },
+  "open-seo": {
+    "workerDir": ".",
+    "about": "",
+    "build": "npx vite build",
+    "test": "bun run test",
+    "typecheck": "bun run types:check",
+    "request": "/",
+    "scanWorker": "server",
+    "scanNote": "",
+    "smoke": [
+      "/",
+      "/sign-in",
+      "/auth-error",
+      "/mcp",
+      "/agents/sam-chat/smoke/get-messages",
+      "/api/ai-visibility/download",
+      "/.well-known/oauth-authorization-server",
+      "/api/nope"
+    ]
+  },
+  "supermemory": {
+    "workerDir": ".",
+    "about": "",
+    "build": "npx vite build",
+    "test": "npx react-router typegen && npx tsc -p tsconfig.cloudflare.json --noEmit && npx tsc -p tsconfig.node.json --noEmit",
+    "typecheck": "npx react-router typegen && npx tsc -p tsconfig.cloudflare.json --noEmit && npx tsc -p tsconfig.node.json --noEmit",
+    "request": "/",
+    "scanNote": "The app's variables are not available, so `/` answers 5xx; judge each change by the startup numbers.",
+    "smoke": [
+      "/",
+      "/nope",
+      "/smoke-user/sse",
+      "/smoke-user/messages"
+    ]
+  }
+}

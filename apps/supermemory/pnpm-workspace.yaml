@@ -1,0 +1,8 @@
+packages:
+  - '.'
+overrides:
+  vite: 8.3.5
+  rolldown: 1.2.16
+minimumReleaseAge: 0
+blockExoticSubdeps: false
+strictDepBuilds: false

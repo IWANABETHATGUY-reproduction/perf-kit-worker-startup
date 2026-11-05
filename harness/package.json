@@ -1,0 +1,9 @@
+{
+  "name": "perf-kit-eval-harness",
+  "private": true,
+  "type": "module",
+  "description": "Prepares, gates and scores the eval apps. Pins the scorer's wrangler.",
+  "dependencies": {
+    "wrangler": "4.156.0"
+  }
+}

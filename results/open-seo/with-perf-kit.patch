@@ -1,0 +1,3580 @@
+diff --git a/src/lib/auth-mode.ts b/src/lib/auth-mode.ts
+index e1e529f..172496b 100644
+--- a/src/lib/auth-mode.ts
++++ b/src/lib/auth-mode.ts
+@@ -1,5 +1,3 @@
+-import { z } from "zod";
+-
+ // - cloudflare_access / local_noauth: self-hosted, identity comes from outside
+ //   the app (an Access JWT, or a fixed local admin); no accounts of its own.
+ // - hosted: OpenSEO Cloud. Better Auth accounts plus the hosted business
+@@ -21,13 +19,17 @@ export const AUTH_MODES = [
+ 
+ type AuthMode = (typeof AUTH_MODES)[number];
+ 
+-const authModeSchema = z.enum(AUTH_MODES);
++function isAuthMode(value: unknown): value is AuthMode {
++  return (
++    typeof value === "string" &&
++    (AUTH_MODES as readonly string[]).includes(value)
++  );
++}
+ 
+ const warnedInvalidAuthModes = new Set<string>();
+ 
+ export function getAuthMode(value: string | null | undefined): AuthMode {
+-  const parsed = authModeSchema.safeParse(value);
+-  if (parsed.success) return parsed.data;
++  if (isAuthMode(value)) return value;
+ 
+   // Unset stays a silent fail-closed default; a SET-but-invalid value is a
+   // typo the operator needs to hear about — silently coercing it made every
+diff --git a/src/server.ts b/src/server.ts
+index 8eedd84..08c8b6d 100644
+--- a/src/server.ts
++++ b/src/server.ts
+@@ -1,17 +1,3 @@
+-import {
+-  createStartHandler,
+-  defaultStreamHandler,
+-} from "@tanstack/react-start/server";
+-import { routeAgentRequest } from "agents";
+-import { everyApp } from "@every-app/sdk/server";
+-import { serveEveryAppRequest } from "@/server/lib/gateway-attribution";
+-import { resolveUserContextFromHeaders } from "@/middleware/ensure-user/resolve";
+-import { ProjectRepository } from "@/server/features/projects/repositories/ProjectRepository";
+-import { SamSessionRepository } from "@/server/features/sam/SamSessionRepository";
+-import { runScheduledRankChecks } from "@/server/features/rank-tracking/services/scheduledRankChecks";
+-import { reconcileStaleAudits } from "@/server/features/audit/services/auditReconciler";
+-import { sendFirstAuditEmails } from "@/server/features/audit/services/firstAuditEmails";
+-import { getOrCreateOrganizationCustomer } from "@/server/billing/subscription";
+ import { isHostedServerAuthMode } from "@/server/lib/runtime-env";
+ import {
+   getAuthMode,
+@@ -19,25 +5,35 @@ import {
+   setRuntimeAuthMode,
+   usesBetterAuth,
+ } from "@/lib/auth-mode";
+-import {
++import type {
+   createOpenSeoOAuthProvider,
+-  type OpenSeoOAuthEnv,
++  OpenSeoOAuthEnv,
+ } from "@/server/mcp/oauth-provider";
+-import { requestWithPublicOrigin } from "@/server/mcp/public-origin";
+-import { MCP_ROUTE } from "@/server/mcp/context";
+-import { withPgClient } from "@/db";
+-import { withDataforseoSlots } from "@/server/lib/dataforseo/request-slots";
+-import {
+-  AUTUMN_WEBHOOK_PATH,
+-  handleAutumnWebhookRequest,
+-} from "@/server/billing/autumn-webhook";
+-import { sweepDubReferredOrganizations } from "@/server/referrals/dub";
+-import { maybeSendSelfHostHeartbeat } from "@/server/lib/self-host-telemetry";
+-import { handleOperatorRequest } from "@/server/standalone/admin";
+-import { handleImport, isLegacyImportActive } from "@/server/standalone/import";
+ import { hasOperatorSecret } from "@/server/standalone/operator-auth";
+ 
+-const startHandler = createStartHandler(defaultStreamHandler);
++type StartHandler = (request: Request) => Response | Promise<Response>;
++type OAuthProvider = ReturnType<typeof createOpenSeoOAuthProvider>;
++
++// Everything below is only needed once a request or cron actually runs. Keep
++// it off the global scope so a cold isolate does not parse and evaluate the
++// whole request stack before serving its first request.
++let startHandlerPromise: Promise<StartHandler> | undefined;
++let oauthProviderPromise: Promise<OAuthProvider> | undefined;
++
++function getStartHandler(): Promise<StartHandler> {
++  startHandlerPromise ??= import("@tanstack/react-start/server").then(
++    ({ createStartHandler, defaultStreamHandler }) =>
++      createStartHandler(defaultStreamHandler) as StartHandler,
++  );
++  return startHandlerPromise;
++}
++
++function getOpenSeoOAuthProvider(): Promise<OAuthProvider> {
++  oauthProviderPromise ??= import("@/server/mcp/oauth-provider").then(
++    ({ createOpenSeoOAuthProvider }) => createOpenSeoOAuthProvider(appFetch),
++  );
++  return oauthProviderPromise;
++}
+ 
+ // The app ships no security response headers of its own, so any third-party
+ // page can frame an app route and UI-redress a one-click action (delete a
+@@ -53,6 +49,7 @@ const startHandler = createStartHandler(defaultStreamHandler);
+ // one call site covers the OAuth-provider path too, which serves app documents
+ // through this same function.
+ async function appFetch(request: Request): Promise<Response> {
++  const startHandler = await getStartHandler();
+   const response = await startHandler(request);
+   const contentType = response.headers.get("content-type") ?? "";
+   if (
+@@ -70,8 +67,6 @@ async function appFetch(request: Request): Promise<Response> {
+   });
+ }
+ 
+-const openSeoOAuthProvider = createOpenSeoOAuthProvider(appFetch);
+-
+ // Authorize a SAM agent connection in the Worker, before it reaches the Durable
+ // Object. The DO instance name is the sessionId (set client-side); we resolve
+ // the session here and authorize the caller against the session's project via
+@@ -84,10 +79,17 @@ async function authorizeSamChat(
+ ): Promise<Response | undefined> {
+   let context;
+   try {
++    const { resolveUserContextFromHeaders } = await import(
++      "@/middleware/ensure-user/resolve"
++    );
+     context = await resolveUserContextFromHeaders(request.headers);
+   } catch {
+     return new Response("Unauthorized", { status: 401 });
+   }
++  const [{ SamSessionRepository }, { ProjectRepository }] = await Promise.all([
++    import("@/server/features/sam/SamSessionRepository"),
++    import("@/server/features/projects/repositories/ProjectRepository"),
++  ]);
+   const session = await SamSessionRepository.getActiveSession(
+     sessionId,
+     context.userId,
+@@ -105,6 +107,9 @@ async function authorizeSamChat(
+   // before the DO's balance gate runs, or a brand-new org's first message hits
+   // a false "out of credits". Hosted-only; self-hosted has no Autumn.
+   if (await isHostedServerAuthMode()) {
++    const { getOrCreateOrganizationCustomer } = await import(
++      "@/server/billing/subscription"
++    );
+     await getOrCreateOrganizationCustomer(context);
+   }
+   return undefined;
+@@ -127,6 +132,7 @@ function authorizeChatAgent(
+ // and any HTTP message-history fetch), keeping it off the OAuth wrapper and
+ // TanStack route guard below.
+ async function routeChatAgents(request: Request, env: Env): Promise<Response> {
++  const { routeAgentRequest } = await import("agents");
+   const response = await routeAgentRequest(request, env, {
+     onBeforeConnect: (req, lobby) => authorizeChatAgent(req, lobby),
+     onBeforeRequest: (req, lobby) => authorizeChatAgent(req, lobby),
+@@ -134,7 +140,7 @@ async function routeChatAgents(request: Request, env: Env): Promise<Response> {
+   return response ?? new Response("Not found", { status: 404 });
+ }
+ 
+-function fetch(
++async function fetch(
+   request: Request,
+   env: Env,
+   ctx: ExecutionContext,
+@@ -142,6 +148,10 @@ function fetch(
+   // Scope a per-request Postgres client (no-op in D1 mode). The client isn't
+   // closed here — the Workers↔Hyperdrive socket is reclaimed at invocation end.
+   // The DataForSEO cap is per request too, matching the connection limit.
++  const [{ withPgClient }, { withDataforseoSlots }] = await Promise.all([
++    import("@/db"),
++    import("@/server/lib/dataforseo/request-slots"),
++  ]);
+   return withPgClient(() =>
+     withDataforseoSlots(() => Promise.resolve(handleFetch(request, env, ctx))),
+   );
+@@ -162,6 +172,10 @@ async function handleEveryAppRequest(
+     const { everyAppTools } = await import("@/server/everyapp/tools");
+     return everyAppTools.fetch(request, env, ctx);
+   }
++  const [{ everyApp }, { serveEveryAppRequest }] = await Promise.all([
++    import("@every-app/sdk/server"),
++    import("@/server/lib/gateway-attribution"),
++  ]);
+   // everyApp() also drops any Set-Cookie on the way out.
+   return everyApp<Env>((verified, _env, _ctx, user) =>
+     serveEveryAppRequest(verified, user, () =>
+@@ -188,20 +202,33 @@ async function handleAppRequest(
+ ): Promise<Response> {
+   const authMode = getAuthMode(env.AUTH_MODE);
+   setRuntimeAuthMode(env.AUTH_MODE);
++  const { requestWithPublicOrigin } = await import(
++    "@/server/mcp/public-origin"
++  );
+   const publicRequest = requestWithPublicOrigin(request);
+   const pathname = new URL(publicRequest.url).pathname;
+-  ctx.waitUntil(maybeSendSelfHostHeartbeat(pathname));
++  ctx.waitUntil(
++    import("@/server/lib/self-host-telemetry").then(
++      ({ maybeSendSelfHostHeartbeat }) => maybeSendSelfHostHeartbeat(pathname),
++    ),
++  );
+ 
+   // Standalone Docker operator tooling (account commands, legacy import).
+   // Both handlers answer 404 without the operator secret; the block is also
+   // what keeps hosted from paying a KV read per request.
+   if (hasOperatorSecret()) {
++    const { handleImport, isLegacyImportActive } = await import(
++      "@/server/standalone/import"
++    );
+     if (pathname === "/api/standalone/import")
+       return handleImport(publicRequest);
+     if (await isLegacyImportActive()) {
+       return new Response("Data import in progress", { status: 503 });
+     }
+     if (pathname === "/api/standalone/admin") {
++      const { handleOperatorRequest } = await import(
++        "@/server/standalone/admin"
++      );
+       return handleOperatorRequest(publicRequest);
+     }
+   }
+@@ -217,11 +244,19 @@ async function handleAppRequest(
+     return routeChatAgents(publicRequest, env);
+   }
+ 
+-  if (isHostedAuthMode(authMode) && pathname === AUTUMN_WEBHOOK_PATH) {
+-    return handleAutumnWebhookRequest(publicRequest);
++  if (isHostedAuthMode(authMode) && pathname.startsWith("/api/autumn/")) {
++    // Same path as AUTUMN_WEBHOOK_PATH; loading the webhook module only for
++    // its prefix keeps its zod/signature stack out of the global scope.
++    const { AUTUMN_WEBHOOK_PATH, handleAutumnWebhookRequest } = await import(
++      "@/server/billing/autumn-webhook"
++    );
++    if (pathname === AUTUMN_WEBHOOK_PATH) {
++      return handleAutumnWebhookRequest(publicRequest);
++    }
+   }
+ 
+   if (usesBetterAuth(authMode)) {
++    const openSeoOAuthProvider = await getOpenSeoOAuthProvider();
+     return openSeoOAuthProvider.fetch(
+       publicRequest,
+       env as OpenSeoOAuthEnv,
+@@ -231,7 +266,7 @@ async function handleAppRequest(
+ 
+   if (
+     (authMode === "cloudflare_access" || authMode === "local_noauth") &&
+-    pathname === MCP_ROUTE
++    pathname === "/mcp" // MCP_ROUTE
+   ) {
+     return import("@/server/mcp/transport").then(
+       ({ handleSelfHostedOpenSeoMcpRequest }) =>
+@@ -262,21 +297,31 @@ export default {
+     _ctx: ExecutionContext,
+   ) {
+     // A legacy Docker import owns the database until it finishes.
+-    if (hasOperatorSecret() && (await isLegacyImportActive())) return;
++    if (hasOperatorSecret()) {
++      const { isLegacyImportActive } = await import(
++        "@/server/standalone/import"
++      );
++      if (await isLegacyImportActive()) return;
++    }
+     if (controller.cron === MCP_OAUTH_PURGE_CRON) {
+       const authMode = getAuthMode(env.AUTH_MODE);
+       // Only the modes with their own accounts run the OAuth provider (and
+       // have OAUTH_KV bound).
+       if (usesBetterAuth(authMode)) {
++        const openSeoOAuthProvider = await getOpenSeoOAuthProvider();
+         const result = await openSeoOAuthProvider.purgeExpiredData(
+           env as OpenSeoOAuthEnv,
+         );
+         console.log("[mcp-oauth] purged expired OAuth data", result);
+       }
++      const { withPgClient } = await import("@/db");
+       if (isHostedAuthMode(authMode)) {
+         // Daily referral-sale sweep: catches paid Autumn invoices the
+         // billing.updated webhook path misses (renewals, one-time top-ups).
+         try {
++          const { sweepDubReferredOrganizations } = await import(
++            "@/server/referrals/dub"
++          );
+           await sweepDubReferredOrganizations();
+         } catch (err) {
+           console.error("[cron] Dub referral sale sweep failed:", err);
+@@ -313,6 +358,10 @@ export default {
+     // before the rank loop so a slow tick can't delay or starve it. Its
+     // failure is held until after the rank checks so it can't suppress them,
+     // then rethrown so the invocation still reports as failed.
++    const [{ withPgClient }, { reconcileStaleAudits }] = await Promise.all([
++      import("@/db"),
++      import("@/server/features/audit/services/auditReconciler"),
++    ]);
+     let watchdogError: unknown;
+     try {
+       await withPgClient(() => reconcileStaleAudits());
+@@ -324,6 +373,13 @@ export default {
+     // The cron itself calls no provider: it starts Workflows, each carrying
+     // the organization that owns the tracker, which every gateway call the
+     // run makes names (gateway-attribution.ts).
++    const [{ runScheduledRankChecks }, { sendFirstAuditEmails }] =
++      await Promise.all([
++        import(
++          "@/server/features/rank-tracking/services/scheduledRankChecks"
++        ),
++        import("@/server/features/audit/services/firstAuditEmails"),
++      ]);
+     const checks = await Promise.allSettled([
+       withPgClient(() => runScheduledRankChecks(env)),
+       withPgClient(async () => {
+diff --git a/src/server/features/sam/SamChatAgent.ts b/src/server/features/sam/SamChatAgent.ts
+index c4143a4..ce7fbb0 100644
+--- a/src/server/features/sam/SamChatAgent.ts
++++ b/src/server/features/sam/SamChatAgent.ts
+@@ -1,602 +1,278 @@
+-import { Think } from "@cloudflare/think";
+-import type {
+-  ChatErrorContext,
+-  ChatRecoveryContext,
+-  ChatRecoveryOptions,
+-  ChatResponseResult,
+-  SaveMessagesResult,
+-  Session,
+-  StepContext,
+-  ToolCallResultContext,
+-  TurnConfig,
+-  TurnContext,
+-} from "@cloudflare/think";
+-import { clearChatTerminal } from "agents/chat";
+-import { createCompactFunction } from "agents/sessions";
+-import { generateText, type UIMessage } from "ai";
+-import { z } from "zod";
+-import { eq } from "drizzle-orm";
+-import { db, withPgClient } from "@/db";
+-import { user } from "@/db/schema";
+-import {
+-  openRouterCostUsd,
+-  staticAssistantModel,
+-} from "@/server/lib/chatAgent";
+-import { SamSessionRepository } from "@/server/features/sam/SamSessionRepository";
+-import { ProjectContextService } from "@/server/features/project-context/services/ProjectContextService";
+-import { ProjectRepository } from "@/server/features/projects/repositories/ProjectRepository";
+-import { buildSamSkillSource } from "@/server/features/sam/samSkills";
+-import { buildSamSystemPrompt } from "@/server/features/sam/samSystemPrompt";
+-import {
+-  SamTelemetry,
+-  type SamTurnStats,
+-} from "@/server/features/sam/samTurnTelemetry";
+-import { buildSamChatModel } from "@/server/lib/openrouter";
+-import {
+-  isHostedServerAuthMode,
+-  usesBetterAuthServer,
+-} from "@/server/lib/runtime-env";
+-import {
+-  checkUsageCreditsDepleted,
+-  trackUsageCreditSpend,
+-} from "@/server/billing/subscription";
+-import { getPublicOrigin } from "@/server/mcp/public-origin";
+-import { MCP_SCOPE } from "@/lib/oauth-resource";
+-import { AuthRepository } from "@/server/auth/repositories/AuthRepository";
+-import type { ToolAuthContext } from "@/server/mcp/context";
++import { DurableObject } from "cloudflare:workers";
++import type { SamChatAgent as SamChatAgentImpl } from "./SamChatAgentImpl";
+ 
+-// SAM's read-only view of the project's shared memory. The block has no `set`
+-// provider, so Think exposes no set_context tool for it; writes go through the
+-// update_project_context tool, the same one MCP clients and the settings UI use.
+-const PROJECT_CONTEXT_BLOCK = "project_context";
+-
+-const PUBLIC_ORIGIN_KEY = "sam-public-origin";
+-
+-// Batching threshold for metering, not a charge: the user pays the turn's
+-// actual OpenRouter cost (times the usual markup) whatever this is set to.
+-// Spend accumulates step by step and is sent to Autumn once the unbilled
+-// total reaches this much, with the remainder flushed when the turn ends —
+-// so a $0.50 turn is ~10 Autumn calls rather than one per step, and a turn
+-// the isolate kills mid-way has at most this much unbilled. Each call rounds
+-// up to a whole credit (a tenth of a cent).
+-const SAM_BILLING_CHUNK_USD = 0.05;
+-
+-// Long tool-heavy turns are what outgrow the Durable Object memory limit; the
+-// model's 1M-token window never gets a say. Compact between turns past this
+-// estimated token count, and mid-turn once a step's input passes 90% of the
+-// proactive ceiling — both far below the window, because the constraint is DO
+-// memory, not the provider.
+-//
+-// The between-turn threshold is compared against the Session's built-in
+-// estimate (~4 chars/token over the full stored transcript). That runs high
+-// relative to what the model receives, because Think clips tool outputs
+-// older than the last four messages to 500 chars on every call, so it fires
+-// early — the safe side. Don't pass a tokenCounter built on the model's
+-// reported usage: the Session also calls the counter per single message when
+-// choosing what to protect, and a whole-prompt number collapses the protected
+-// tail to two messages. A real per-message counter means a tokenizer in the
+-// bundle, which costs the same heap we're protecting.
+-const SAM_COMPACT_AFTER_TOKENS = 120_000;
+-const SAM_MAX_INPUT_TOKENS = 160_000;
+-
+-const INTERRUPTED_TURN_NOTICE =
+-  "That reply was cut off before it finished — the work got too big to complete in one go. Everything above is saved. Ask again for a narrower slice (fewer keywords, competitors, or pages), or tell me where to pick up.";
+-
+-// Derive a short session title from the first user message.
+-function deriveTitle(text: string): string {
+-  const trimmed = text.replace(/\s+/g, " ").trim();
+-  if (!trimmed) return "New chat";
+-  return trimmed.length > 60 ? `${trimmed.slice(0, 57)}…` : trimmed;
+-}
+-
+-function firstUserText(messages: UIMessage[]): string {
+-  const firstUser = messages.find((message) => message.role === "user");
+-  const textPart = firstUser?.parts.find((part) => part.type === "text");
+-  return textPart?.text ?? "";
+-}
+-
+-type SamContext = {
+-  row: NonNullable<
+-    Awaited<ReturnType<typeof SamSessionRepository.getSessionById>>
+-  >;
+-  project: NonNullable<
+-    Awaited<ReturnType<typeof ProjectRepository.getProjectById>>
+-  >;
+-  // The session row is normalized (project/user ids only); the creating
+-  // user's current email is resolved here for the billing/MCP auth context.
+-  userEmail: string;
+-};
++const GET_IMPL = Symbol("getSamChatAgentImpl");
+ 
+ /**
+- * Durable Object backing the SAM in-app agent, built on Think. One DO per chat
+- * session (Think hosts one conversation per instance); the DO instance name IS
+- * the session id, set by the client (`useAgent({ name: sessionId })`) and
+- * authorized in the Worker (`onBeforeConnect`) before any connection reaches
+- * here — so the DO trusts that its caller may act on `this.name` and derives
+- * project/user from the sam_sessions row (and the org from the project).
+- *
+- * Think owns the agentic loop (streaming, persistence, compaction-ready
+- * history, context blocks); this subclass contributes the model, the MCP
+- * toolset, the billing gate/metering, and project-scoped memory: the
+- * "project_context" block renders the project's shared memory, which every
+- * session in the project — and the MCP server and settings UI — reads and
+- * writes through ProjectContextService.
++ * Every public method the Agent/Think stack exposes. Workerd discovers RPC
++ * methods on the exported class, so the wrapper has to carry the same names;
++ * each one lazily loads the implementation and forwards the call to the same
++ * instance. Keep this list in sync when the Agent/Think API gains a method.
+  */
+-export class SamChatAgent extends Think {
+-  // SAM's toolset is the MCP tools from beforeTurn; it has no use for Think's
+-  // workspace bash tool, whose just-bash dependency is stubbed out of the
+-  // bundle anyway (see vite.config.ts) to keep ~30 MB of eagerly-evaluated
+-  // source out of every isolate's baseline heap.
+-  override workspaceBash = false;
+-
+-  // Session row + project, resolved once per DO lifetime (the binding is
+-  // immutable). Null until a turn/provider needs it — and left null when the
+-  // registry row is gone, which beforeTurn turns into a polite refusal.
+-  private samContext: SamContext | null = null;
+-
+-  // Per-turn billing state: beforeTurn arms it (non-null = hosted mode, meter
+-  // this turn), onStepFinish accumulates OpenRouter cost and meters it in
+-  // chunks as the turn runs, onChatResponse/onChatError flush the remainder.
+-  // Chunked per step rather than once per turn so a turn the Durable Object
+-  // memory limit kills mid-way still bills what it spent — the Sep 2026
+-  // recovery loop burned ~$160/day of OpenRouter spend that never reached
+-  // onChatResponse. Deductions run off the inference loop, serialized so they
+-  // land in order; waitUntil keeps the final flush alive in the background.
+-  private turnUnbilledUsd = 0;
+-  private turnMonthlyRemaining: number | null = null;
+-  private billing: Promise<void> = Promise.resolve();
+-
+-  // Turn telemetry: armed in beforeTurn, fed by the step and tool hooks,
+-  // reported once as `sam:turn` when the turn ends by any route (response,
+-  // error, or a memory-limit kill surfacing as recovery).
+-  private readonly telemetry = new SamTelemetry(
+-    () => this.name,
+-    () => withPgClient(() => this.loadSamContext()),
+-    (promise) => this.ctx.waitUntil(promise),
+-  );
+-
+-  // Mid-turn context guard, using the compaction configured in
+-  // configureSession (see SAM_MAX_INPUT_TOKENS). The reactive backstop is
+-  // deliberately off: it re-runs the whole turn from compacted history, which
+-  // would re-issue every tool call — a second site audit, a second DataForSEO
+-  // charge for the same research — on a classifier that is a regex over the
+-  // provider's error text. A turn that still overflows ends as an error the
+-  // user can retry.
+-  override contextOverflow = {
+-    proactive: { maxInputTokens: SAM_MAX_INPUT_TOKENS },
+-  };
+-
+-  /** Permanently remove this session's transcript for an account erasure. */
+-  async destroyForErasure(): Promise<void> {
+-    for (const socket of this.ctx.getWebSockets()) {
+-      socket.close(1000, "Account erased");
+-    }
+-    this.cancelAllChats();
+-    await this.waitUntilStable({ timeout: 5000 });
+-    await this.ctx.storage.deleteAlarm();
+-    await this.ctx.storage.deleteAll();
+-  }
++const FORWARDED_METHODS = [
++  "__unsafe_ensureInitialized",
++  "_cfDeliverWorkflowNotification",
++  "_cfDetachedNotifyFinish",
++  "_cfDetachedReconcileTick",
++  "_cfEvictAgedMedia",
++  "_cfRunConnectionlessContinuation",
++  "_cfRunSubmission",
++  "_cf_acquireFacetKeepAlive",
++  "_cf_broadcastToSubAgent",
++  "_cf_checkRunFibersForFacet",
++  "_cf_cleanupFacetPrefix",
++  "_cf_closeSubAgentConnection",
++  "_cf_closeSubAgentConnectionsForPrefix",
++  "_cf_destroyDescendantFacet",
++  "_cf_handleSubAgentWebSocketClose",
++  "_cf_handleSubAgentWebSocketConnect",
++  "_cf_handleSubAgentWebSocketMessage",
++  "_cf_initAsFacet",
++  "_cf_invokeAgentPath",
++  "_cf_invokeSubAgent",
++  "_cf_invokeSubAgentPath",
++  "_cf_registerFacetRun",
++  "_cf_releaseFacetKeepAlive",
++  "_cf_routeLifecycle",
++  "_cf_scheduleDestroy",
++  "_cf_sendToSubAgentConnection",
++  "_cf_setSubAgentConnectionState",
++  "_cf_subAgentConnectionMetas",
++  "_cf_unregisterFacetRun",
++  "_chatRecoveryContinue",
++  "_chatRecoveryRetry",
++  "_cleanupStreamBuffers",
++  "_hostDeleteFile",
++  "_hostGetContext",
++  "_hostGetMessages",
++  "_hostGetSessionInfo",
++  "_hostListFiles",
++  "_hostReadFile",
++  "_hostSendMessage",
++  "_hostSetContext",
++  "_hostWriteFile",
++  "_onAlarmHousekeeping",
++  "_onEmail",
++  "_runDeclaredScheduledTask",
++  "_runMessengerReplyTask",
++  "_unsafe_getConnectionFlag",
++  "_unsafe_setConnectionFlag",
++  "_workflow_broadcast",
++  "_workflow_handleCallback",
++  "_workflow_updateState",
++  "abortSubAgent",
++  "addMcpServer",
++  "addMessages",
++  "afterToolCall",
++  "alarm",
++  "approveExecution",
++  "approveWorkflow",
++  "authorizeAction",
++  "authorizeTurn",
++  "beforeStep",
++  "beforeToolCall",
++  "beforeTurn",
++  "bindActiveDeliverySurface",
++  "broadcast",
++  "cancelAgentTool",
++  "cancelAgentToolRun",
++  "cancelAllChats",
++  "cancelChat",
++  "cancelFiber",
++  "cancelFiberByKey",
++  "cancelSchedule",
++  "cancelSubmission",
++  "chat",
++  "chatWithMessengerContext",
++  "classifyChatError",
++  "clearAgentToolRuns",
++  "clearMessages",
++  "configure",
++  "configureChannels",
++  "configureContext",
++  "configureSession",
++  "connect",
++  "createMcpOAuthProvider",
++  "deleteFibers",
++  "deleteSubAgent",
++  "deleteSubmission",
++  "deleteSubmissions",
++  "deleteWorkflow",
++  "deleteWorkflows",
++  "deliverNotice",
++  "dequeue",
++  "dequeueAll",
++  "dequeueAllByCallback",
++  "describePausedExecution",
++  "destroy",
++  "fetch",
++  "getAIBinding",
++  "getActions",
++  "getAgentToolChunks",
++  "getCallableMethods",
++  "getConfig",
++  "getConnection",
++  "getConnectionTags",
++  "getConnections",
++  "getDefaultTimezone",
++  "getExtensions",
++  "getMcpServers",
++  "getMessages",
++  "getMessengerContext",
++  "getMessengers",
++  "getModel",
++  "getOnStartDegradations",
++  "getQueue",
++  "getQueues",
++  "getSchedule",
++  "getScheduleById",
++  "getScheduledTasks",
++  "getSchedules",
++  "getSkillScriptRunner",
++  "getSkills",
++  "getSystemPrompt",
++  "getTools",
++  "getWorkflow",
++  "getWorkflowStatus",
++  "getWorkflows",
++  "hasAgentToolRun",
++  "hasSubAgent",
++  "inspectAgentToolRun",
++  "inspectFiber",
++  "inspectFiberByKey",
++  "inspectSubmission",
++  "internal_reconcileScheduledTasks",
++  "isConnectionProtocolEnabled",
++  "isConnectionReadonly",
++  "keepAlive",
++  "keepAliveWhile",
++  "listFibers",
++  "listSchedules",
++  "listSubAgents",
++  "listSubmissions",
++  "migrateWorkflowBinding",
++  "notifyInterruptedTurn",
++  "onAgentToolFinish",
++  "onAgentToolStart",
++  "onAlarm",
++  "onBeforeSubAgent",
++  "onChatError",
++  "onChatResponse",
++  "onChunk",
++  "onClose",
++  "onConnect",
++  "onError",
++  "onFiberRecovered",
++  "onJob",
++  "onMessage",
++  "onProgress",
++  "onRequest",
++  "onStart",
++  "onStateChanged",
++  "onStateUpdate",
++  "onStepEnd",
++  "onStepFinish",
++  "onWorkflowCallback",
++  "onWorkflowComplete",
++  "onWorkflowError",
++  "onWorkflowEvent",
++  "onWorkflowProgress",
++  "parentAgent",
++  "pauseWorkflow",
++  "pendingApprovals",
++  "pendingExecutions",
++  "queue",
++  "rejectExecution",
++  "rejectWorkflow",
++  "removeMcpServer",
++  "render",
++  "renderAttachment",
++  "replyAttachments",
++  "replyToEmail",
++  "reportProgress",
++  "resolveFiber",
++  "resolveModel",
++  "restartWorkflow",
++  "resumeWorkflow",
++  "retry",
++  "runAgentTool",
++  "runFiber",
++  "runTurn",
++  "runWorkflow",
++  "saveMessages",
++  "schedule",
++  "scheduleEvery",
++  "sendEmail",
++  "sendWorkflowEvent",
++  "setConnectionReadonly",
++  "setState",
++  "shouldConnectionBeReadonly",
++  "shouldSendProtocolMessages",
++  "sql",
++  "startAgentToolRun",
++  "startFiber",
++  "stash",
++  "subAgent",
++  "submitMessages",
++  "tailAgentToolRun",
++  "terminateWorkflow",
++  "validateStateChange",
++  "webSocketClose",
++  "webSocketError",
++  "webSocketMessage",
++] as const;
++
++type ForwardedMethod = (...args: unknown[]) => unknown;
+ 
+-  // Record the app origin for the deep links tools attach to responses,
+-  // derived from the requests this DO serves instead of env config. DO storage
+-  // (not an instance field) because the DO hibernates: a turn can arrive as a
+-  // WS message on a wake-up where fetch() never ran. Reads are served from
+-  // workerd's in-process cache and unchanged puts are deduped, so this costs
+-  // nothing per turn.
+-  async fetch(request: Request): Promise<Response> {
+-    await this.ctx.storage.put(PUBLIC_ORIGIN_KEY, getPublicOrigin(request));
+-    return super.fetch(request);
+-  }
+-
+-  getModel() {
+-    return this.buildModel("max");
+-  }
+-
+-  private buildModel(reasoningEffort: "max" | "low") {
+-    return buildSamChatModel(this.env, reasoningEffort);
+-  }
+-
+-  override getSkills() {
+-    return [buildSamSkillSource()];
+-  }
+-
+-  override afterToolCall(ctx: ToolCallResultContext) {
+-    this.telemetry.toolCall(ctx);
+-  }
+-
+-  configureSession(session: Session): Session {
+-    return session
+-      .withContext("soul", {
+-        provider: { get: () => this.buildSoulPrompt() },
+-      })
+-      .withContext(PROJECT_CONTEXT_BLOCK, {
+-        description:
+-          "This project's shared memory — sections, competitors, key pages and research log, the same records the user sees in the app. Change it with update_project_context.",
+-        provider: { get: () => this.renderProjectContext() },
+-      })
+-      .onCompaction(
+-        createCompactFunction({
+-          summarize: (prompt) => this.summarizeForCompaction(prompt),
+-        }),
+-      )
+-      .compactAfter(SAM_COMPACT_AFTER_TOKENS);
+-  }
+-
+-  // Compaction summaries run outside the step loop (so outside onStepFinish),
+-  // on the same model at low reasoning; their cost joins the turn's total.
+-  private async summarizeForCompaction(prompt: string): Promise<string> {
+-    const result = await generateText({
+-      model: this.buildModel("low"),
+-      prompt,
+-    });
+-    this.recordSpend(openRouterCostUsd(result.providerMetadata));
+-    this.telemetry.compaction();
+-    return result.text;
+-  }
+-
+-  private async loadSamContext(): Promise<SamContext | null> {
+-    if (this.samContext) return this.samContext;
+-    const row = await SamSessionRepository.getSessionById(this.name);
+-    if (!row) return null;
+-    const project = await ProjectRepository.getProjectById(row.projectId);
+-    if (!project) return null;
+-    const [creator] = await db
+-      .select({ email: user.email })
+-      .from(user)
+-      .where(eq(user.id, row.userId))
+-      .limit(1);
+-    if (!creator) return null;
+-    this.samContext = { row, project, userEmail: creator.email };
+-    return this.samContext;
+-  }
+-
+-  // The identity block. Runs through the context-block pipeline like the
+-  // project-memory block, so it re-renders (fresh project row, intake mode
+-  // on/off) whenever the prompt is refreshed.
+-  private buildSoulPrompt(): Promise<string> {
+-    return withPgClient(async () => {
+-      const ctx = await this.loadSamContext();
+-      if (!ctx) {
+-        return "You are SAM, the SEO agent inside OpenSEO. This chat session no longer exists; tell the user to start a new chat.";
+-      }
+-      const context = await ProjectContextService.getProjectContext(
+-        ctx.project.id,
+-      );
+-      return buildSamSystemPrompt(
+-        {
+-          projectId: ctx.project.id,
+-          projectName: ctx.project.name,
+-          domain: ctx.project.domain,
+-          locationCode: ctx.project.locationCode,
+-          languageCode: ctx.project.languageCode,
+-        },
+-        // Nothing recorded about the business yet: SAM runs its intake flow.
+-        { intakeMode: context.missingSections.includes("business_overview") },
+-      );
+-    });
+-  }
+-
+-  // The project-memory block. Scopes its own Postgres client: providers are
+-  // invoked from Think's internals, so no ambient withPgClient scope can be
+-  // assumed (no-op in D1 mode).
+-  private renderProjectContext(): Promise<string | null> {
+-    return withPgClient(async () => {
+-      const ctx = await this.loadSamContext();
+-      if (!ctx) return null;
+-      return ProjectContextService.renderProjectContextMarkdown(
+-        await ProjectContextService.getProjectContext(ctx.project.id),
+-      );
+-    });
+-  }
+-
+-  // Gates swap the model for one turn: the canned model streams the refusal
+-  // back through Think's normal pipeline (rendered and persisted like any
+-  // assistant message) without calling a provider, so a refusal is free even
+-  // when users script them. The old version made a real 200-token call, which
+-  // MiniMax M3 could spend entirely on reasoning tokens — leaving the user a
+-  // truncated chain-of-thought and no reply (issue #161).
+-  private refusalTurn(text: string): TurnConfig {
+-    return { model: staticAssistantModel(text) };
+-  }
+-
+-  async beforeTurn(turnCtx: TurnContext): Promise<TurnConfig> {
+-    // turnUnbilledUsd deliberately carries over: a between-turn compaction
+-    // summary can land after the previous flush, and it is the same org's
+-    // spend either way.
+-    this.turnMonthlyRemaining = null;
+-    const turn = this.telemetry.beginTurn(turnCtx.continuation);
+-    return withPgClient(async (): Promise<TurnConfig> => {
+-      const ctx = await this.loadSamContext();
+-      if (!ctx) {
+-        turn.refusal = "no_session";
+-        return this.refusalTurn(
+-          "I couldn't find this chat session. Please start a new one.",
+-        );
+-      }
+-
+-      // Gate every turn on credits in hosted mode: SAM is open to every plan
+-      // (including free), and LLM tokens plus DataForSEO tool calls all draw
+-      // down the org's credit balance. Self-hosted brings its own provider
+-      // keys and has no Autumn balance, so it's ungated. Depletion is
+-      // confirmed against a second Autumn read path before refusing — a
+-      // stale check reading here once locked a paying customer out of chat.
+-      const { organizationId } = ctx.project;
+-      const hosted = await isHostedServerAuthMode();
+-      if (hosted) {
+-        const gate = await checkUsageCreditsDepleted({
+-          userId: ctx.row.userId,
+-          userEmail: ctx.userEmail,
+-          organizationId,
+-          projectId: ctx.project.id,
+-        });
+-        if (gate.depleted) {
+-          turn.refusal = "credits";
+-          // A spent budget holds credits back; buying more would not help.
+-          return this.refusalTurn(
+-            `${gate.budgetReached ? "You've hit your monthly auto-reload budget. Raise it" : "You're out of credits. Upgrade your plan or buy more credits"} on the Billing page to keep using SAM.`,
+-          );
+-        }
+-        this.turnMonthlyRemaining = gate.monthlyRemaining;
+-      }
+-
+-      const baseUrl =
+-        (await this.ctx.storage.get<string>(PUBLIC_ORIGIN_KEY)) ??
+-        "https://app.openseo.so";
+-      // Delegated/self-host orgs have no member rows — implicit owner. With
+-      // real accounts (hosted and password modes) a missing member row means the
+-      // user was removed from the workspace; fail closed instead of letting
+-      // the open socket keep owner-level tools (WebSockets authorize at
+-      // connect time only, so this per-turn check is what actually revokes a
+-      // removed member's chat).
+-      const membership = await AuthRepository.getMembership(
+-        ctx.row.userId,
+-        organizationId,
+-      );
+-      if ((await usesBetterAuthServer()) && !membership) {
+-        turn.refusal = "no_access";
+-        return this.refusalTurn(
+-          "You no longer have access to this organization, so I can't continue this chat.",
+-        );
+-      }
+-      const authContext: ToolAuthContext = {
+-        userId: ctx.row.userId,
+-        userEmail: ctx.userEmail,
+-        organizationId,
+-        role: membership?.role ?? "owner",
+-        baseUrl,
+-        clientId: null,
+-        scopes: [MCP_SCOPE],
+-      };
+-
+-      // Loaded per turn, not at startup: the tool schemas are costly to build.
+-      const samTools = await import("@/server/features/sam/samChatTools");
+-      return {
+-        tools: samTools.buildSamMcpTools(authContext, ctx.project, turn.turnId),
+-        // SAM runs complex multi-step work in one turn (site-read intake plus
+-        // a full research chain, multi-competitor sweeps), so the step budget
+-        // is generous; cost is bounded by per-step metering and the model
+-        // stopping on its own. The per-step token budget is shared by
+-        // max-effort reasoning and the visible reply, so it stays well above
+-        // measured reasoning use (~3k tokens — a tight cap lets reasoning eat
+-        // the reply, issue #161) but below the 32k that, with 48 steps, let a
+-        // single turn outgrow the Durable Object memory limit.
+-        maxSteps: 40,
+-        maxOutputTokens: 16_000,
+-      };
+-    });
+-  }
+-
+-  onStepFinish(ctx: StepContext): void {
+-    const costUsd = openRouterCostUsd(ctx.providerMetadata);
+-    this.recordSpend(costUsd);
+-    this.telemetry.step(ctx, costUsd);
+-  }
+-
+-  // Add spend to the turn's unbilled total and meter it once a chunk has
+-  // accumulated, or on `flush` at the end of the turn. Self-hosted turns (no
+-  // armed balance) are never metered.
+-  private recordSpend(costUsd: number, { flush = false } = {}): void {
+-    this.turnUnbilledUsd += costUsd;
+-    this.telemetry.spend(costUsd);
+-    const armed = this.turnMonthlyRemaining;
+-    if (armed === null) return;
+-    if (!flush && this.turnUnbilledUsd < SAM_BILLING_CHUNK_USD) return;
+-    const chunkUsd = this.turnUnbilledUsd;
+-    this.turnUnbilledUsd = 0;
+-    const turn = this.telemetry.turn;
+-    this.billing = this.billing
+-      .then(() => this.meterSpend(chunkUsd, armed, turn))
+-      .catch((error: unknown) => {
+-        console.error("[sam] credit metering failed", error);
+-        this.telemetry.captureError(error, { stage: "metering" });
+-      });
+-  }
+-
+-  private async meterSpend(
+-    costUsd: number,
+-    armedMonthlyRemaining: number,
+-    turn: SamTurnStats | null,
+-  ): Promise<void> {
+-    const ctx = await withPgClient(() => this.loadSamContext());
+-    if (!ctx) return;
+-    // Earlier chunks in the chain have already drawn the monthly balance
+-    // down; the value captured at enqueue time only covers a flush that
+-    // outlives its turn (onChatError), where the field has been re-armed.
+-    const { monthlyCredits, topupCredits } = await trackUsageCreditSpend({
+-      customer: {
+-        userId: ctx.row.userId,
+-        userEmail: ctx.userEmail,
+-        organizationId: ctx.project.organizationId,
+-        projectId: ctx.project.id,
++/**
++ * The SAM chat Durable Object is loaded by class name on every isolate, but
++ * Think and the agent stack (AI SDK, MCP, drizzle) are only needed when a
++ * session actually gets a request. Extending DurableObject keeps the runtime
++ * contract (RPC on the class stub works); the implementation is imported on
++ * the first call and constructed once with the same state and env.
++ */
++export class SamChatAgent extends DurableObject<Env> {
++  #impl: SamChatAgentImpl | undefined;
++  #loading: Promise<SamChatAgentImpl> | undefined;
++
++  [GET_IMPL](): Promise<SamChatAgentImpl> {
++    if (this.#impl) return Promise.resolve(this.#impl);
++    this.#loading ??= import("./SamChatAgentImpl").then(
++      ({ SamChatAgent: Impl }) => {
++        const instance = new Impl(this.ctx, this.env);
++        this.#impl = instance;
++        return instance;
+       },
+-      customerId: ctx.project.organizationId,
+-      creditFeature: "agent",
+-      costUsd,
+-      monthlyRemaining: this.turnMonthlyRemaining ?? armedMonthlyRemaining,
+-      properties: { provider: "openrouter", turn_id: turn?.turnId },
+-    });
+-    if (turn) turn.credits += monthlyCredits + topupCredits;
+-    if (this.turnMonthlyRemaining !== null)
+-      this.turnMonthlyRemaining -= monthlyCredits;
+-  }
+-
+-  async onChatResponse(result: ChatResponseResult): Promise<void> {
+-    this.flushSpend();
+-    this.ctx.waitUntil(
+-      this.telemetry.report(
+-        result.status,
+-        { request_id: result.requestId },
+-        this.messages,
+-        { billing: this.billing },
+-      ),
+     );
+-
+-    await withPgClient(async () => {
+-      const ctx = await this.loadSamContext();
+-      if (!ctx) return;
+-
+-      // Name the session from its first message so the side-panel is readable.
+-      if (ctx.row.title === "New chat") {
+-        const title = deriveTitle(firstUserText(this.messages));
+-        if (title !== "New chat") {
+-          await SamSessionRepository.setTitle(ctx.row.id, title);
+-          ctx.row.title = title;
+-        }
+-      } else {
+-        await SamSessionRepository.touch(ctx.row.id);
+-      }
+-    });
+-
+-    // Re-render the blocks so context written during this turn — or by another
+-    // session, the settings UI, or an MCP client — is in the prompt by the next
+-    // turn. One withPgClient scope covers both providers (their own defensive
+-    // scopes reuse it). Best-effort — never fail the response.
+-    if (result.status === "completed") {
+-      await withPgClient(() => this.session.refreshSystemPrompt()).catch(
+-        (error: unknown) => {
+-          console.error("[sam] context refresh failed", error);
+-        },
+-      );
+-    }
+-  }
+-
+-  // The return value becomes the stored chat-terminal body that reconnecting
+-  // clients replay — returning nothing would make it the string "undefined".
+-  onChatError(error: unknown, ctx?: ChatErrorContext): unknown {
+-    console.error("[sam] chat turn error", ctx?.stage, error);
+-    // A stopped or failed turn still consumed what it consumed.
+-    this.flushSpend();
+-    this.telemetry.error(error, ctx, this.messages, this.billing);
+-    return error;
+-  }
+-
+-  // Meter the turn's remainder without holding the turn (and the queue
+-  // behind it) on Autumn: the DO stays alive for the chain via waitUntil,
+-  // which also covers the error stages Think never follows with a response
+-  // hook.
+-  private flushSpend(): void {
+-    this.recordSpend(0, { flush: true });
+-    this.ctx.waitUntil(this.billing);
++    return this.#loading;
+   }
+ 
+-  // Think's chat recovery re-runs an interrupted turn: after a Durable Object
+-  // reset it wakes, reads the incident, and calls the model again to continue
+-  // the partial reply. When the reset was a memory-limit kill (a long,
+-  // tool-heavy turn under GPT-5.6 Luna at max reasoning), every re-run dies at
+-  // the same point, and the bookkeeping that bounds the retry budget dies with
+-  // it — one incident was observed at attempt 44 of a max of 10. Each attempt
+-  // is a full OpenRouter call that never reaches onChatResponse, so none of it
+-  // is metered: in early Sep 2026 these loops were ~95% of the key's spend.
+-  // Keep the durable bookkeeping (partial reply persisted) but never re-run
+-  // inference automatically; the user resends instead. Skipped recoveries
+-  // get no framework banner (that only fires when a retry budget is
+-  // exhausted), so schedule our own notice — delivered from inside this hook
+-  // it would land before the partial reply in the transcript.
+-  override async onChatRecovery(
+-    ctx: ChatRecoveryContext,
+-  ): Promise<ChatRecoveryOptions> {
+-    console.warn("[sam] interrupted turn not re-run", {
+-      name: this.name,
+-      incidentId: ctx.incidentId,
+-      recoveryKind: ctx.recoveryKind,
+-    });
+-    // The DO that ran the turn is gone with its stats; this is the only
+-    // signal that a turn was killed, so count it as its own status.
+-    await this.telemetry.report(
+-      "interrupted",
+-      { incident_id: ctx.incidentId, recovery_kind: ctx.recoveryKind },
+-      this.messages,
+-      { synthesize: true },
++  /** Run the implementation's lifecycle startup (same as getAgentByName). */
++  async __unsafe_ensureInitialized(
++    props?: Record<string, unknown>,
++  ): Promise<void> {
++    return (await this[GET_IMPL]()).__unsafe_ensureInitialized(
++      props as never,
+     );
+-    // Recovery runs from the DO's startup path, and a hook that fails or
+-    // times out is re-run on the next wake; idempotent so the notice is
+-    // scheduled once per incident, not once per restart.
+-    await this.schedule(1, "notifyInterruptedTurn", ctx.incidentId, {
+-      idempotent: true,
+-    });
+-    return { persist: true, continue: false };
+-  }
+-
+-  async notifyInterruptedTurn(): Promise<void> {
+-    await this.deliverNotice(INTERRUPTED_TURN_NOTICE);
+   }
+ 
+-  // Recovery continuations already queued as alarms before this deploy still
+-  // fire, and would each make one more model call (re-arming through the
+-  // alarm circuit breaker when that call OOMs too). Skip them without touching
+-  // the model; Think records the incident as skipped. Every other trigger
+-  // (auto-continuation, RPC, sub-agent) passes through untouched.
+-  protected override async continueLastTurn(
+-    ...args: Parameters<Think["continueLastTurn"]>
+-  ): Promise<SaveMessagesResult> {
+-    if (args[1]?.trigger === "recovery-continue") {
+-      console.warn("[sam] skipped queued recovery continuation", {
+-        name: this.name,
+-      });
+-      return { requestId: crypto.randomUUID(), status: "skipped" };
+-    }
+-    return super.continueLastTurn(...args);
++  /** Permanently remove this session's transcript for an account erasure. */
++  async destroyForErasure(): Promise<void> {
++    return (await this[GET_IMPL]()).destroyForErasure();
+   }
++}
+ 
+-  // POST .../rewind {messageId}: delete that message and everything after it on
+-  // the active branch. Backs the client's undo (rewind past a user message) and
+-  // edit (rewind, then resend the edited text). Authorized in the Worker like
+-  // every other HTTP request to this DO. Think's own onRequest wrapper handles
+-  // /get-messages before delegating here.
+-  async onRequest(request: Request): Promise<Response> {
+-    if (
+-      request.method === "POST" &&
+-      new URL(request.url).pathname.endsWith("/rewind")
+-    ) {
+-      const body = z
+-        .object({ messageId: z.string().min(1) })
+-        .safeParse(await request.json().catch(() => null));
+-      if (!body.success) {
+-        return Response.json({ error: "messageId required" }, { status: 400 });
+-      }
+-      const { messageId } = body.data;
+-      // A rewind can race an in-flight turn (the user undoes while the agent
+-      // is still working, e.g. after the stream stalled client-side). Abort
+-      // the turn and wait for it to settle BEFORE deleting, or its still-
+-      // running loop keeps streaming chunks and persists a fresh assistant
+-      // message right after the delete — an orphaned reply to nothing.
+-      this.cancelAllChats();
+-      await this.waitUntilStable({ timeout: 5000 });
+-      const index = this.messages.findIndex(
+-        (message) => message.id === messageId,
+-      );
+-      if (index === -1) {
+-        return Response.json({ error: "message not found" }, { status: 404 });
+-      }
+-      const ids = this.messages.slice(index).map((message) => message.id);
+-      await this.session.deleteMessages(ids);
+-      // Drop the stored how-the-last-turn-ended record too. It exists so a
+-      // reconnecting client can learn the last turn errored — but that turn
+-      // was just undone, and leaving it makes every future connection replay
+-      // a "Something went wrong" for a message that no longer exists.
+-      await clearChatTerminal(this.ctx.storage);
+-      return Response.json({ ok: true });
+-    }
+-    return super.onRequest(request);
+-  }
++for (const method of FORWARDED_METHODS) {
++  Object.defineProperty(SamChatAgent.prototype, method, {
++    configurable: true,
++    writable: true,
++    value: async function (this: SamChatAgent, ...args: unknown[]) {
++      const impl = await this[GET_IMPL]();
++      const forward = (
++        impl as unknown as Record<string, ForwardedMethod | undefined>
++      )[method];
++      if (!forward) throw new Error(`SamChatAgent has no method ${method}`);
++      return forward.apply(impl, args);
++    },
++  });
+ }
+diff --git a/src/server/features/sam/SamChatAgentImpl.ts b/src/server/features/sam/SamChatAgentImpl.ts
+new file mode 100644
+index 0000000..c4143a4
+--- /dev/null
++++ b/src/server/features/sam/SamChatAgentImpl.ts
+@@ -0,0 +1,602 @@
++import { Think } from "@cloudflare/think";
++import type {
++  ChatErrorContext,
++  ChatRecoveryContext,
++  ChatRecoveryOptions,
++  ChatResponseResult,
++  SaveMessagesResult,
++  Session,
++  StepContext,
++  ToolCallResultContext,
++  TurnConfig,
++  TurnContext,
++} from "@cloudflare/think";
++import { clearChatTerminal } from "agents/chat";
++import { createCompactFunction } from "agents/sessions";
++import { generateText, type UIMessage } from "ai";
++import { z } from "zod";
++import { eq } from "drizzle-orm";
++import { db, withPgClient } from "@/db";
++import { user } from "@/db/schema";
++import {
++  openRouterCostUsd,
++  staticAssistantModel,
++} from "@/server/lib/chatAgent";
++import { SamSessionRepository } from "@/server/features/sam/SamSessionRepository";
++import { ProjectContextService } from "@/server/features/project-context/services/ProjectContextService";
++import { ProjectRepository } from "@/server/features/projects/repositories/ProjectRepository";
++import { buildSamSkillSource } from "@/server/features/sam/samSkills";
++import { buildSamSystemPrompt } from "@/server/features/sam/samSystemPrompt";
++import {
++  SamTelemetry,
++  type SamTurnStats,
++} from "@/server/features/sam/samTurnTelemetry";
++import { buildSamChatModel } from "@/server/lib/openrouter";
++import {
++  isHostedServerAuthMode,
++  usesBetterAuthServer,
++} from "@/server/lib/runtime-env";
++import {
++  checkUsageCreditsDepleted,
++  trackUsageCreditSpend,
++} from "@/server/billing/subscription";
++import { getPublicOrigin } from "@/server/mcp/public-origin";
++import { MCP_SCOPE } from "@/lib/oauth-resource";
++import { AuthRepository } from "@/server/auth/repositories/AuthRepository";
++import type { ToolAuthContext } from "@/server/mcp/context";
++
++// SAM's read-only view of the project's shared memory. The block has no `set`
++// provider, so Think exposes no set_context tool for it; writes go through the
++// update_project_context tool, the same one MCP clients and the settings UI use.
++const PROJECT_CONTEXT_BLOCK = "project_context";
++
++const PUBLIC_ORIGIN_KEY = "sam-public-origin";
++
++// Batching threshold for metering, not a charge: the user pays the turn's
++// actual OpenRouter cost (times the usual markup) whatever this is set to.
++// Spend accumulates step by step and is sent to Autumn once the unbilled
++// total reaches this much, with the remainder flushed when the turn ends —
++// so a $0.50 turn is ~10 Autumn calls rather than one per step, and a turn
++// the isolate kills mid-way has at most this much unbilled. Each call rounds
++// up to a whole credit (a tenth of a cent).
++const SAM_BILLING_CHUNK_USD = 0.05;
++
++// Long tool-heavy turns are what outgrow the Durable Object memory limit; the
++// model's 1M-token window never gets a say. Compact between turns past this
++// estimated token count, and mid-turn once a step's input passes 90% of the
++// proactive ceiling — both far below the window, because the constraint is DO
++// memory, not the provider.
++//
++// The between-turn threshold is compared against the Session's built-in
++// estimate (~4 chars/token over the full stored transcript). That runs high
++// relative to what the model receives, because Think clips tool outputs
++// older than the last four messages to 500 chars on every call, so it fires
++// early — the safe side. Don't pass a tokenCounter built on the model's
++// reported usage: the Session also calls the counter per single message when
++// choosing what to protect, and a whole-prompt number collapses the protected
++// tail to two messages. A real per-message counter means a tokenizer in the
++// bundle, which costs the same heap we're protecting.
++const SAM_COMPACT_AFTER_TOKENS = 120_000;
++const SAM_MAX_INPUT_TOKENS = 160_000;
++
++const INTERRUPTED_TURN_NOTICE =
++  "That reply was cut off before it finished — the work got too big to complete in one go. Everything above is saved. Ask again for a narrower slice (fewer keywords, competitors, or pages), or tell me where to pick up.";
++
++// Derive a short session title from the first user message.
++function deriveTitle(text: string): string {
++  const trimmed = text.replace(/\s+/g, " ").trim();
++  if (!trimmed) return "New chat";
++  return trimmed.length > 60 ? `${trimmed.slice(0, 57)}…` : trimmed;
++}
++
++function firstUserText(messages: UIMessage[]): string {
++  const firstUser = messages.find((message) => message.role === "user");
++  const textPart = firstUser?.parts.find((part) => part.type === "text");
++  return textPart?.text ?? "";
++}
++
++type SamContext = {
++  row: NonNullable<
++    Awaited<ReturnType<typeof SamSessionRepository.getSessionById>>
++  >;
++  project: NonNullable<
++    Awaited<ReturnType<typeof ProjectRepository.getProjectById>>
++  >;
++  // The session row is normalized (project/user ids only); the creating
++  // user's current email is resolved here for the billing/MCP auth context.
++  userEmail: string;
++};
++
++/**
++ * Durable Object backing the SAM in-app agent, built on Think. One DO per chat
++ * session (Think hosts one conversation per instance); the DO instance name IS
++ * the session id, set by the client (`useAgent({ name: sessionId })`) and
++ * authorized in the Worker (`onBeforeConnect`) before any connection reaches
++ * here — so the DO trusts that its caller may act on `this.name` and derives
++ * project/user from the sam_sessions row (and the org from the project).
++ *
++ * Think owns the agentic loop (streaming, persistence, compaction-ready
++ * history, context blocks); this subclass contributes the model, the MCP
++ * toolset, the billing gate/metering, and project-scoped memory: the
++ * "project_context" block renders the project's shared memory, which every
++ * session in the project — and the MCP server and settings UI — reads and
++ * writes through ProjectContextService.
++ */
++export class SamChatAgent extends Think {
++  // SAM's toolset is the MCP tools from beforeTurn; it has no use for Think's
++  // workspace bash tool, whose just-bash dependency is stubbed out of the
++  // bundle anyway (see vite.config.ts) to keep ~30 MB of eagerly-evaluated
++  // source out of every isolate's baseline heap.
++  override workspaceBash = false;
++
++  // Session row + project, resolved once per DO lifetime (the binding is
++  // immutable). Null until a turn/provider needs it — and left null when the
++  // registry row is gone, which beforeTurn turns into a polite refusal.
++  private samContext: SamContext | null = null;
++
++  // Per-turn billing state: beforeTurn arms it (non-null = hosted mode, meter
++  // this turn), onStepFinish accumulates OpenRouter cost and meters it in
++  // chunks as the turn runs, onChatResponse/onChatError flush the remainder.
++  // Chunked per step rather than once per turn so a turn the Durable Object
++  // memory limit kills mid-way still bills what it spent — the Sep 2026
++  // recovery loop burned ~$160/day of OpenRouter spend that never reached
++  // onChatResponse. Deductions run off the inference loop, serialized so they
++  // land in order; waitUntil keeps the final flush alive in the background.
++  private turnUnbilledUsd = 0;
++  private turnMonthlyRemaining: number | null = null;
++  private billing: Promise<void> = Promise.resolve();
++
++  // Turn telemetry: armed in beforeTurn, fed by the step and tool hooks,
++  // reported once as `sam:turn` when the turn ends by any route (response,
++  // error, or a memory-limit kill surfacing as recovery).
++  private readonly telemetry = new SamTelemetry(
++    () => this.name,
++    () => withPgClient(() => this.loadSamContext()),
++    (promise) => this.ctx.waitUntil(promise),
++  );
++
++  // Mid-turn context guard, using the compaction configured in
++  // configureSession (see SAM_MAX_INPUT_TOKENS). The reactive backstop is
++  // deliberately off: it re-runs the whole turn from compacted history, which
++  // would re-issue every tool call — a second site audit, a second DataForSEO
++  // charge for the same research — on a classifier that is a regex over the
++  // provider's error text. A turn that still overflows ends as an error the
++  // user can retry.
++  override contextOverflow = {
++    proactive: { maxInputTokens: SAM_MAX_INPUT_TOKENS },
++  };
++
++  /** Permanently remove this session's transcript for an account erasure. */
++  async destroyForErasure(): Promise<void> {
++    for (const socket of this.ctx.getWebSockets()) {
++      socket.close(1000, "Account erased");
++    }
++    this.cancelAllChats();
++    await this.waitUntilStable({ timeout: 5000 });
++    await this.ctx.storage.deleteAlarm();
++    await this.ctx.storage.deleteAll();
++  }
++
++  // Record the app origin for the deep links tools attach to responses,
++  // derived from the requests this DO serves instead of env config. DO storage
++  // (not an instance field) because the DO hibernates: a turn can arrive as a
++  // WS message on a wake-up where fetch() never ran. Reads are served from
++  // workerd's in-process cache and unchanged puts are deduped, so this costs
++  // nothing per turn.
++  async fetch(request: Request): Promise<Response> {
++    await this.ctx.storage.put(PUBLIC_ORIGIN_KEY, getPublicOrigin(request));
++    return super.fetch(request);
++  }
++
++  getModel() {
++    return this.buildModel("max");
++  }
++
++  private buildModel(reasoningEffort: "max" | "low") {
++    return buildSamChatModel(this.env, reasoningEffort);
++  }
++
++  override getSkills() {
++    return [buildSamSkillSource()];
++  }
++
++  override afterToolCall(ctx: ToolCallResultContext) {
++    this.telemetry.toolCall(ctx);
++  }
++
++  configureSession(session: Session): Session {
++    return session
++      .withContext("soul", {
++        provider: { get: () => this.buildSoulPrompt() },
++      })
++      .withContext(PROJECT_CONTEXT_BLOCK, {
++        description:
++          "This project's shared memory — sections, competitors, key pages and research log, the same records the user sees in the app. Change it with update_project_context.",
++        provider: { get: () => this.renderProjectContext() },
++      })
++      .onCompaction(
++        createCompactFunction({
++          summarize: (prompt) => this.summarizeForCompaction(prompt),
++        }),
++      )
++      .compactAfter(SAM_COMPACT_AFTER_TOKENS);
++  }
++
++  // Compaction summaries run outside the step loop (so outside onStepFinish),
++  // on the same model at low reasoning; their cost joins the turn's total.
++  private async summarizeForCompaction(prompt: string): Promise<string> {
++    const result = await generateText({
++      model: this.buildModel("low"),
++      prompt,
++    });
++    this.recordSpend(openRouterCostUsd(result.providerMetadata));
++    this.telemetry.compaction();
++    return result.text;
++  }
++
++  private async loadSamContext(): Promise<SamContext | null> {
++    if (this.samContext) return this.samContext;
++    const row = await SamSessionRepository.getSessionById(this.name);
++    if (!row) return null;
++    const project = await ProjectRepository.getProjectById(row.projectId);
++    if (!project) return null;
++    const [creator] = await db
++      .select({ email: user.email })
++      .from(user)
++      .where(eq(user.id, row.userId))
++      .limit(1);
++    if (!creator) return null;
++    this.samContext = { row, project, userEmail: creator.email };
++    return this.samContext;
++  }
++
++  // The identity block. Runs through the context-block pipeline like the
++  // project-memory block, so it re-renders (fresh project row, intake mode
++  // on/off) whenever the prompt is refreshed.
++  private buildSoulPrompt(): Promise<string> {
++    return withPgClient(async () => {
++      const ctx = await this.loadSamContext();
++      if (!ctx) {
++        return "You are SAM, the SEO agent inside OpenSEO. This chat session no longer exists; tell the user to start a new chat.";
++      }
++      const context = await ProjectContextService.getProjectContext(
++        ctx.project.id,
++      );
++      return buildSamSystemPrompt(
++        {
++          projectId: ctx.project.id,
++          projectName: ctx.project.name,
++          domain: ctx.project.domain,
++          locationCode: ctx.project.locationCode,
++          languageCode: ctx.project.languageCode,
++        },
++        // Nothing recorded about the business yet: SAM runs its intake flow.
++        { intakeMode: context.missingSections.includes("business_overview") },
++      );
++    });
++  }
++
++  // The project-memory block. Scopes its own Postgres client: providers are
++  // invoked from Think's internals, so no ambient withPgClient scope can be
++  // assumed (no-op in D1 mode).
++  private renderProjectContext(): Promise<string | null> {
++    return withPgClient(async () => {
++      const ctx = await this.loadSamContext();
++      if (!ctx) return null;
++      return ProjectContextService.renderProjectContextMarkdown(
++        await ProjectContextService.getProjectContext(ctx.project.id),
++      );
++    });
++  }
++
++  // Gates swap the model for one turn: the canned model streams the refusal
++  // back through Think's normal pipeline (rendered and persisted like any
++  // assistant message) without calling a provider, so a refusal is free even
++  // when users script them. The old version made a real 200-token call, which
++  // MiniMax M3 could spend entirely on reasoning tokens — leaving the user a
++  // truncated chain-of-thought and no reply (issue #161).
++  private refusalTurn(text: string): TurnConfig {
++    return { model: staticAssistantModel(text) };
++  }
++
++  async beforeTurn(turnCtx: TurnContext): Promise<TurnConfig> {
++    // turnUnbilledUsd deliberately carries over: a between-turn compaction
++    // summary can land after the previous flush, and it is the same org's
++    // spend either way.
++    this.turnMonthlyRemaining = null;
++    const turn = this.telemetry.beginTurn(turnCtx.continuation);
++    return withPgClient(async (): Promise<TurnConfig> => {
++      const ctx = await this.loadSamContext();
++      if (!ctx) {
++        turn.refusal = "no_session";
++        return this.refusalTurn(
++          "I couldn't find this chat session. Please start a new one.",
++        );
++      }
++
++      // Gate every turn on credits in hosted mode: SAM is open to every plan
++      // (including free), and LLM tokens plus DataForSEO tool calls all draw
++      // down the org's credit balance. Self-hosted brings its own provider
++      // keys and has no Autumn balance, so it's ungated. Depletion is
++      // confirmed against a second Autumn read path before refusing — a
++      // stale check reading here once locked a paying customer out of chat.
++      const { organizationId } = ctx.project;
++      const hosted = await isHostedServerAuthMode();
++      if (hosted) {
++        const gate = await checkUsageCreditsDepleted({
++          userId: ctx.row.userId,
++          userEmail: ctx.userEmail,
++          organizationId,
++          projectId: ctx.project.id,
++        });
++        if (gate.depleted) {
++          turn.refusal = "credits";
++          // A spent budget holds credits back; buying more would not help.
++          return this.refusalTurn(
++            `${gate.budgetReached ? "You've hit your monthly auto-reload budget. Raise it" : "You're out of credits. Upgrade your plan or buy more credits"} on the Billing page to keep using SAM.`,
++          );
++        }
++        this.turnMonthlyRemaining = gate.monthlyRemaining;
++      }
++
++      const baseUrl =
++        (await this.ctx.storage.get<string>(PUBLIC_ORIGIN_KEY)) ??
++        "https://app.openseo.so";
++      // Delegated/self-host orgs have no member rows — implicit owner. With
++      // real accounts (hosted and password modes) a missing member row means the
++      // user was removed from the workspace; fail closed instead of letting
++      // the open socket keep owner-level tools (WebSockets authorize at
++      // connect time only, so this per-turn check is what actually revokes a
++      // removed member's chat).
++      const membership = await AuthRepository.getMembership(
++        ctx.row.userId,
++        organizationId,
++      );
++      if ((await usesBetterAuthServer()) && !membership) {
++        turn.refusal = "no_access";
++        return this.refusalTurn(
++          "You no longer have access to this organization, so I can't continue this chat.",
++        );
++      }
++      const authContext: ToolAuthContext = {
++        userId: ctx.row.userId,
++        userEmail: ctx.userEmail,
++        organizationId,
++        role: membership?.role ?? "owner",
++        baseUrl,
++        clientId: null,
++        scopes: [MCP_SCOPE],
++      };
++
++      // Loaded per turn, not at startup: the tool schemas are costly to build.
++      const samTools = await import("@/server/features/sam/samChatTools");
++      return {
++        tools: samTools.buildSamMcpTools(authContext, ctx.project, turn.turnId),
++        // SAM runs complex multi-step work in one turn (site-read intake plus
++        // a full research chain, multi-competitor sweeps), so the step budget
++        // is generous; cost is bounded by per-step metering and the model
++        // stopping on its own. The per-step token budget is shared by
++        // max-effort reasoning and the visible reply, so it stays well above
++        // measured reasoning use (~3k tokens — a tight cap lets reasoning eat
++        // the reply, issue #161) but below the 32k that, with 48 steps, let a
++        // single turn outgrow the Durable Object memory limit.
++        maxSteps: 40,
++        maxOutputTokens: 16_000,
++      };
++    });
++  }
++
++  onStepFinish(ctx: StepContext): void {
++    const costUsd = openRouterCostUsd(ctx.providerMetadata);
++    this.recordSpend(costUsd);
++    this.telemetry.step(ctx, costUsd);
++  }
++
++  // Add spend to the turn's unbilled total and meter it once a chunk has
++  // accumulated, or on `flush` at the end of the turn. Self-hosted turns (no
++  // armed balance) are never metered.
++  private recordSpend(costUsd: number, { flush = false } = {}): void {
++    this.turnUnbilledUsd += costUsd;
++    this.telemetry.spend(costUsd);
++    const armed = this.turnMonthlyRemaining;
++    if (armed === null) return;
++    if (!flush && this.turnUnbilledUsd < SAM_BILLING_CHUNK_USD) return;
++    const chunkUsd = this.turnUnbilledUsd;
++    this.turnUnbilledUsd = 0;
++    const turn = this.telemetry.turn;
++    this.billing = this.billing
++      .then(() => this.meterSpend(chunkUsd, armed, turn))
++      .catch((error: unknown) => {
++        console.error("[sam] credit metering failed", error);
++        this.telemetry.captureError(error, { stage: "metering" });
++      });
++  }
++
++  private async meterSpend(
++    costUsd: number,
++    armedMonthlyRemaining: number,
++    turn: SamTurnStats | null,
++  ): Promise<void> {
++    const ctx = await withPgClient(() => this.loadSamContext());
++    if (!ctx) return;
++    // Earlier chunks in the chain have already drawn the monthly balance
++    // down; the value captured at enqueue time only covers a flush that
++    // outlives its turn (onChatError), where the field has been re-armed.
++    const { monthlyCredits, topupCredits } = await trackUsageCreditSpend({
++      customer: {
++        userId: ctx.row.userId,
++        userEmail: ctx.userEmail,
++        organizationId: ctx.project.organizationId,
++        projectId: ctx.project.id,
++      },
++      customerId: ctx.project.organizationId,
++      creditFeature: "agent",
++      costUsd,
++      monthlyRemaining: this.turnMonthlyRemaining ?? armedMonthlyRemaining,
++      properties: { provider: "openrouter", turn_id: turn?.turnId },
++    });
++    if (turn) turn.credits += monthlyCredits + topupCredits;
++    if (this.turnMonthlyRemaining !== null)
++      this.turnMonthlyRemaining -= monthlyCredits;
++  }
++
++  async onChatResponse(result: ChatResponseResult): Promise<void> {
++    this.flushSpend();
++    this.ctx.waitUntil(
++      this.telemetry.report(
++        result.status,
++        { request_id: result.requestId },
++        this.messages,
++        { billing: this.billing },
++      ),
++    );
++
++    await withPgClient(async () => {
++      const ctx = await this.loadSamContext();
++      if (!ctx) return;
++
++      // Name the session from its first message so the side-panel is readable.
++      if (ctx.row.title === "New chat") {
++        const title = deriveTitle(firstUserText(this.messages));
++        if (title !== "New chat") {
++          await SamSessionRepository.setTitle(ctx.row.id, title);
++          ctx.row.title = title;
++        }
++      } else {
++        await SamSessionRepository.touch(ctx.row.id);
++      }
++    });
++
++    // Re-render the blocks so context written during this turn — or by another
++    // session, the settings UI, or an MCP client — is in the prompt by the next
++    // turn. One withPgClient scope covers both providers (their own defensive
++    // scopes reuse it). Best-effort — never fail the response.
++    if (result.status === "completed") {
++      await withPgClient(() => this.session.refreshSystemPrompt()).catch(
++        (error: unknown) => {
++          console.error("[sam] context refresh failed", error);
++        },
++      );
++    }
++  }
++
++  // The return value becomes the stored chat-terminal body that reconnecting
++  // clients replay — returning nothing would make it the string "undefined".
++  onChatError(error: unknown, ctx?: ChatErrorContext): unknown {
++    console.error("[sam] chat turn error", ctx?.stage, error);
++    // A stopped or failed turn still consumed what it consumed.
++    this.flushSpend();
++    this.telemetry.error(error, ctx, this.messages, this.billing);
++    return error;
++  }
++
++  // Meter the turn's remainder without holding the turn (and the queue
++  // behind it) on Autumn: the DO stays alive for the chain via waitUntil,
++  // which also covers the error stages Think never follows with a response
++  // hook.
++  private flushSpend(): void {
++    this.recordSpend(0, { flush: true });
++    this.ctx.waitUntil(this.billing);
++  }
++
++  // Think's chat recovery re-runs an interrupted turn: after a Durable Object
++  // reset it wakes, reads the incident, and calls the model again to continue
++  // the partial reply. When the reset was a memory-limit kill (a long,
++  // tool-heavy turn under GPT-5.6 Luna at max reasoning), every re-run dies at
++  // the same point, and the bookkeeping that bounds the retry budget dies with
++  // it — one incident was observed at attempt 44 of a max of 10. Each attempt
++  // is a full OpenRouter call that never reaches onChatResponse, so none of it
++  // is metered: in early Sep 2026 these loops were ~95% of the key's spend.
++  // Keep the durable bookkeeping (partial reply persisted) but never re-run
++  // inference automatically; the user resends instead. Skipped recoveries
++  // get no framework banner (that only fires when a retry budget is
++  // exhausted), so schedule our own notice — delivered from inside this hook
++  // it would land before the partial reply in the transcript.
++  override async onChatRecovery(
++    ctx: ChatRecoveryContext,
++  ): Promise<ChatRecoveryOptions> {
++    console.warn("[sam] interrupted turn not re-run", {
++      name: this.name,
++      incidentId: ctx.incidentId,
++      recoveryKind: ctx.recoveryKind,
++    });
++    // The DO that ran the turn is gone with its stats; this is the only
++    // signal that a turn was killed, so count it as its own status.
++    await this.telemetry.report(
++      "interrupted",
++      { incident_id: ctx.incidentId, recovery_kind: ctx.recoveryKind },
++      this.messages,
++      { synthesize: true },
++    );
++    // Recovery runs from the DO's startup path, and a hook that fails or
++    // times out is re-run on the next wake; idempotent so the notice is
++    // scheduled once per incident, not once per restart.
++    await this.schedule(1, "notifyInterruptedTurn", ctx.incidentId, {
++      idempotent: true,
++    });
++    return { persist: true, continue: false };
++  }
++
++  async notifyInterruptedTurn(): Promise<void> {
++    await this.deliverNotice(INTERRUPTED_TURN_NOTICE);
++  }
++
++  // Recovery continuations already queued as alarms before this deploy still
++  // fire, and would each make one more model call (re-arming through the
++  // alarm circuit breaker when that call OOMs too). Skip them without touching
++  // the model; Think records the incident as skipped. Every other trigger
++  // (auto-continuation, RPC, sub-agent) passes through untouched.
++  protected override async continueLastTurn(
++    ...args: Parameters<Think["continueLastTurn"]>
++  ): Promise<SaveMessagesResult> {
++    if (args[1]?.trigger === "recovery-continue") {
++      console.warn("[sam] skipped queued recovery continuation", {
++        name: this.name,
++      });
++      return { requestId: crypto.randomUUID(), status: "skipped" };
++    }
++    return super.continueLastTurn(...args);
++  }
++
++  // POST .../rewind {messageId}: delete that message and everything after it on
++  // the active branch. Backs the client's undo (rewind past a user message) and
++  // edit (rewind, then resend the edited text). Authorized in the Worker like
++  // every other HTTP request to this DO. Think's own onRequest wrapper handles
++  // /get-messages before delegating here.
++  async onRequest(request: Request): Promise<Response> {
++    if (
++      request.method === "POST" &&
++      new URL(request.url).pathname.endsWith("/rewind")
++    ) {
++      const body = z
++        .object({ messageId: z.string().min(1) })
++        .safeParse(await request.json().catch(() => null));
++      if (!body.success) {
++        return Response.json({ error: "messageId required" }, { status: 400 });
++      }
++      const { messageId } = body.data;
++      // A rewind can race an in-flight turn (the user undoes while the agent
++      // is still working, e.g. after the stream stalled client-side). Abort
++      // the turn and wait for it to settle BEFORE deleting, or its still-
++      // running loop keeps streaming chunks and persists a fresh assistant
++      // message right after the delete — an orphaned reply to nothing.
++      this.cancelAllChats();
++      await this.waitUntilStable({ timeout: 5000 });
++      const index = this.messages.findIndex(
++        (message) => message.id === messageId,
++      );
++      if (index === -1) {
++        return Response.json({ error: "message not found" }, { status: 404 });
++      }
++      const ids = this.messages.slice(index).map((message) => message.id);
++      await this.session.deleteMessages(ids);
++      // Drop the stored how-the-last-turn-ended record too. It exists so a
++      // reconnecting client can learn the last turn errored — but that turn
++      // was just undone, and leaving it makes every future connection replay
++      // a "Something went wrong" for a message that no longer exists.
++      await clearChatTerminal(this.ctx.storage);
++      return Response.json({ ok: true });
++    }
++    return super.onRequest(request);
++  }
++}
+diff --git a/src/server/standalone/import.ts b/src/server/standalone/import.ts
+index d9fac7b..d12779d 100644
+--- a/src/server/standalone/import.ts
++++ b/src/server/standalone/import.ts
+@@ -1,4 +1,3 @@
+-import { getAgentByName } from "agents";
+ import { env } from "cloudflare:workers";
+ import { z } from "zod";
+ import { runD1ImportBatch } from "@/db/runBatch";
+@@ -102,7 +101,10 @@ export async function handleImport(request: Request): Promise<Response> {
+     const namespace =
+       // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the binding is declared as this class in wrangler.standalone.json
+       env.SAM_CHAT as unknown as DurableObjectNamespace<StandaloneSamChatAgent>;
+-    const stub = await getAgentByName(namespace, input.sessionId);
++    const stub = namespace.get(namespace.idFromName(input.sessionId));
++    // getAgentByName's Agent<Env> constraint no longer fits the lazy wrapper;
++    // this is the same lifecycle start it performs for a default-routing stub.
++    await stub.__unsafe_ensureInitialized();
+     if (input.command === "sam-counts")
+       return Response.json(await stub.legacyHistoryCounts());
+     await stub.importLegacyHistory(input);
+diff --git a/src/server/workflows/AiVisibilityWorkflow.ts b/src/server/workflows/AiVisibilityWorkflow.ts
+index 0d2875c..8e4ba5e 100644
+--- a/src/server/workflows/AiVisibilityWorkflow.ts
++++ b/src/server/workflows/AiVisibilityWorkflow.ts
+@@ -3,280 +3,21 @@ import {
+   type WorkflowEvent,
+   type WorkflowStep,
+ } from "cloudflare:workers";
+-import { pgStep } from "./pgStep";
+-import { yieldingStep } from "./yieldingStep";
+-import {
+-  collectAiLiveBatch,
+-  collectAiModelBatch,
+-  collectAiRound,
+-  collectLateAiAnswers,
+-  postAiBatch,
+-  prepareAiRun,
+-  type AiPendingTask,
+-} from "@/server/features/ai-visibility/services/aiVisibilityCollection";
+-import {
+-  finalizeAiRun,
+-  markAiRunFailed,
+-} from "@/server/features/ai-visibility/services/aiVisibilityRunOutcome";
+-import {
+-  settleAiRun,
+-  type AiPostedHold,
+-} from "@/server/features/ai-visibility/services/aiVisibilityBilling";
+-import { runAiResearchSetup } from "@/server/features/ai-visibility/services/aiResearchKeywords";
+-import type { BillingCustomerContext } from "@/server/billing/subscription";
+-import { AI_TRACKING_HOLD_TTL_MS } from "@/server/lib/dataforseo";
+-import { describeError } from "@/server/lib/errors";
+-
+-// One binding serves answer collection runs and the one-time research setup,
+-// so setup needs no new workflow infrastructure.
+-type AiVisibilityPayload = (
+-  | { runId: string }
+-  | { setupProjectId: string; runSeededTracking?: boolean }
+-) & {
+-  customer: BillingCustomerContext;
+-};
+-
+-// Metered and paid steps run once: a retry could post (and bill) twice.
+-const SINGLE_ATTEMPT = {
+-  retries: { limit: 0, delay: "1 second" as const },
+-  timeout: "2 minutes" as const,
+-};
+-// Steps that only read and write our own rows are free and safe to repeat, so
+-// an engine failure on one attempt does not fail the run.
+-const FREE_STEP = {
+-  retries: { limit: 2, delay: "10 seconds" as const },
+-  timeout: "2 minutes" as const,
+-};
+-// task_get is free and saving an answer replaces its evidence, so collect
+-// steps can retry.
+-const COLLECT_STEP = {
+-  retries: { limit: 2, delay: "10 seconds" as const },
+-  timeout: "5 minutes" as const,
+-};
+-// Live answers are billed per call, so a live step runs once too. It waits for
+-// up to 6 answers, each up to 120 seconds, and asks a failed answer up to 3
+-// times.
+-const LIVE_STEP = { ...SINGLE_ATTEMPT, timeout: "10 minutes" as const };
+-// Standard-queue answers usually arrive within minutes. Cumulative waits are
+-// 2 / 4 / 7 / 10 / 14 / 18 / 22 / 26 / 30 minutes; anything still missing then
+-// fails as not collected, until a late read finds it. Each sleep stays under 5
+-// minutes, like rank check's: the engine cancels an invocation idling in a
+-// longer sleep.
+-const POLL_INTERVALS = [
+-  "2 minutes",
+-  "2 minutes",
+-  "3 minutes",
+-  "3 minutes",
+-  "4 minutes",
+-  "4 minutes",
+-  "4 minutes",
+-  "4 minutes",
+-  "4 minutes",
+-] as const;
+-// After the run finishes, answers DataForSEO has not returned yet are read
+-// every 30 minutes, so a provider delay fills the run in late without holding
+-// up the tracker. Reads stop an hour before the credit hold expires, which
+-// leaves time to settle it; the hold starts after the workflow does.
+-const LATE_READ_INTERVAL_MS = 30 * 60_000;
+-const LATE_READS_FOR_MS = AI_TRACKING_HOLD_TTL_MS - 60 * 60_000;
+ 
+-export class AiVisibilityWorkflow extends WorkflowEntrypoint<
+-  Env,
+-  AiVisibilityPayload
+-> {
++/**
++ * Lazy entry for the AI-visibility workflow. The runtime loads this class by
++ * name at Worker startup, but the workflow implementation is only needed once
++ * an instance runs. Keep the class name and the `run` signature: the wrapper
++ * forwards the same event and step unchanged.
++ */
++export class AiVisibilityWorkflow extends WorkflowEntrypoint<Env, unknown> {
+   async run(
+-    event: WorkflowEvent<AiVisibilityPayload>,
+-    engineStep: WorkflowStep,
+-  ) {
+-    const step = yieldingStep(engineStep);
+-    const { payload } = event;
+-    if ("setupProjectId" in payload)
+-      // No retries: each attempt is a paid model call. The user can retry.
+-      return pgStep(
+-        step,
+-        "research-setup",
+-        { retries: { limit: 0, delay: "1 second" }, timeout: "5 minutes" },
+-        () =>
+-          runAiResearchSetup(
+-            { projectId: payload.setupProjectId },
+-            payload.customer,
+-            { runSeededTracking: payload.runSeededTracking },
+-          ),
+-      );
+-    const { runId, customer } = payload;
+-    let pending: AiPendingTask[] = [];
+-    // Each posted batch holds credits until settle charges the answers that
+-    // arrived, once late reads end or the run fails.
+-    const holds: AiPostedHold[] = [];
+-    // A run in flight across the deploy that added holds replays an older
+-    // post output, the bare task list, which was charged when posted.
+-    const queue = (posted: Awaited<ReturnType<typeof postAiBatch>>) => {
+-      if (Array.isArray(posted)) return pending.push(...posted);
+-      if (posted.hold) holds.push(posted.hold);
+-      pending.push(...posted.pending);
+-    };
+-    const settle = async () => {
+-      if (holds.length === 0) return;
+-      const posted = holds.splice(0);
+-      try {
+-        // Safe to retry: Autumn settles a hold once, then forgets its lock.
+-        await pgStep(step, "settle", FREE_STEP, () =>
+-          settleAiRun(runId, customer, posted),
+-        );
+-      } catch (error) {
+-        // A hold left open expires at its TTL without charging.
+-        console.error(
+-          `[ai-visibility] ${runId} settle failed: ${describeError(error)}`,
+-          error,
+-        );
+-      }
+-    };
+-    const markFailed = async (error: unknown) => {
+-      await settle();
+-      await pgStep(step, "mark-failed", FREE_STEP, () =>
+-        markAiRunFailed(runId),
+-      );
+-      throw error;
+-    };
+-    const failRun = (error: unknown) => {
+-      console.error(
+-        `[ai-visibility] ${runId} failed: ${describeError(error)}`,
+-        error,
+-      );
+-      return markFailed(error);
+-    };
+-    let plan: Awaited<ReturnType<typeof prepareAiRun>>;
+-    // Reads the pending answers once, then posts each answer that DataForSEO's
+-    // backend failed again in its own step, since a post is billed. The read
+-    // steps are `read-*`, not the older `collect-*`: a run in flight across a
+-    // deploy must not replay a `collect-*` output, which had another shape.
+-    const collect = async (name: string, canRetry: boolean) => {
+-      const remaining = pending;
+-      let round: Awaited<ReturnType<typeof collectAiRound>>;
+-      try {
+-        round = await pgStep(step, `read-${name}`, COLLECT_STEP, () =>
+-          collectAiRound(runId, remaining, canRetry),
+-        );
+-      } catch (error) {
+-        // Posted tasks keep their credit hold; poll them again next round.
+-        console.warn(
+-          `[ai-visibility] ${runId} read-${name}: ${describeError(error)}`,
+-        );
+-        return;
+-      }
+-      pending = round.pending;
+-      for (const [index, batch] of round.retry.entries()) {
+-        try {
+-          queue(
+-            await pgStep(step, `repost-${name}-${index}`, SINGLE_ATTEMPT, () =>
+-              postAiBatch(runId, customer, plan.market, batch),
+-            ),
+-          );
+-        } catch (error) {
+-          // Its answers fail at finalize.
+-          console.warn(
+-            `[ai-visibility] ${runId} repost-${name}: ${describeError(error)}`,
+-          );
+-        }
+-      }
+-    };
+-    try {
+-      plan = await pgStep(step, "prepare", FREE_STEP, () =>
+-        prepareAiRun(runId),
+-      );
+-    } catch (error) {
+-      return failRun(error);
+-    }
+-    // A batch whose step fails, on the engine's own error or a timeout, leaves
+-    // its answers pending for finalize to fail. The other batches still run,
+-    // so the run keeps every answer it got.
+-    if (plan.live)
+-      // Live runs save each live batch as it returns, so nothing is left
+-      // pending to poll.
+-      for (const [index, tasks] of plan.batches.entries())
+-        try {
+-          await pgStep(step, `live-${index}`, LIVE_STEP, () =>
+-            collectAiLiveBatch(runId, customer, plan.market, tasks),
+-          );
+-        } catch (error) {
+-          console.warn(
+-            `[ai-visibility] ${runId} live-${index}: ${describeError(error)}`,
+-          );
+-        }
+-    else
+-      for (const [index, batch] of plan.batches.entries())
+-        try {
+-          queue(
+-            await pgStep(step, `post-${index}`, SINGLE_ATTEMPT, () =>
+-              postAiBatch(runId, customer, plan.market, batch),
+-            ),
+-          );
+-        } catch (error) {
+-          console.warn(
+-            `[ai-visibility] ${runId} post-${index}: ${describeError(error)}`,
+-          );
+-        }
+-    // Claude and Perplexity answers come from the model API on every run.
+-    // Queued answers process meanwhile, and each model batch is followed by
+-    // one free read of them.
+-    for (const [index, batch] of plan.modelBatches.entries()) {
+-      try {
+-        await pgStep(step, `model-${index}`, LIVE_STEP, () =>
+-          collectAiModelBatch(runId, customer, plan.market, batch),
+-        );
+-      } catch (error) {
+-        // Its unsaved answers fail at finalize; the other batches continue.
+-        console.warn(
+-          `[ai-visibility] ${runId} model-${index}: ${describeError(error)}`,
+-        );
+-      }
+-      if (pending.length) await collect(`model-${index}`, true);
+-    }
+-    for (
+-      let round = 0;
+-      round < POLL_INTERVALS.length && pending.length > 0;
+-      round++
+-    ) {
+-      try {
+-        await step.sleep(`wait-${round}`, POLL_INTERVALS[round]);
+-      } catch (error) {
+-        // The engine cancels an invocation idling in a long sleep, which
+-        // rejects it here, then resumes the instance on wake. That interrupt
+-        // never runs mark-failed, so only a real failure fails the run. Don't
+-        // log it as one.
+-        return markFailed(error);
+-      }
+-      // A task posted after the last round would never be read.
+-      await collect(`${round}`, round < POLL_INTERVALS.length - 1);
+-    }
+-    let finishedAt: number;
+-    try {
+-      finishedAt = await pgStep(step, "finalize", FREE_STEP, async () => {
+-        await finalizeAiRun(runId);
+-        return Date.now();
+-      });
+-    } catch (error) {
+-      return failRun(error);
+-    }
+-    const lateUntil = event.timestamp.getTime() + LATE_READS_FOR_MS;
+-    for (let round = 1; pending.length > 0; round++) {
+-      const wakeAt = finishedAt + round * LATE_READ_INTERVAL_MS;
+-      if (wakeAt > lateUntil) break;
+-      // Uncaught: the engine cancels an invocation idling this long and
+-      // resumes the instance on wake, so the rejection is no failure, and
+-      // settling here would charge before late answers arrive.
+-      await step.sleepUntil(`late-wait-${round}`, wakeAt);
+-      try {
+-        pending = await pgStep(step, `late-${round}`, COLLECT_STEP, () =>
+-          collectLateAiAnswers(runId, pending),
+-        );
+-      } catch (error) {
+-        // Read again next round.
+-        console.warn(
+-          `[ai-visibility] ${runId} late-${round}: ${describeError(error)}`,
+-        );
+-      }
+-    }
+-    await settle();
++    event: WorkflowEvent<unknown>,
++    step: WorkflowStep,
++  ): Promise<unknown> {
++    const { AiVisibilityWorkflow: Impl } = await import(
++      "./AiVisibilityWorkflowImpl"
++    );
++    return new Impl(this.ctx, this.env).run(event as never, step);
+   }
+ }
+diff --git a/src/server/workflows/AiVisibilityWorkflowImpl.ts b/src/server/workflows/AiVisibilityWorkflowImpl.ts
+new file mode 100644
+index 0000000..0d2875c
+--- /dev/null
++++ b/src/server/workflows/AiVisibilityWorkflowImpl.ts
+@@ -0,0 +1,282 @@
++import {
++  WorkflowEntrypoint,
++  type WorkflowEvent,
++  type WorkflowStep,
++} from "cloudflare:workers";
++import { pgStep } from "./pgStep";
++import { yieldingStep } from "./yieldingStep";
++import {
++  collectAiLiveBatch,
++  collectAiModelBatch,
++  collectAiRound,
++  collectLateAiAnswers,
++  postAiBatch,
++  prepareAiRun,
++  type AiPendingTask,
++} from "@/server/features/ai-visibility/services/aiVisibilityCollection";
++import {
++  finalizeAiRun,
++  markAiRunFailed,
++} from "@/server/features/ai-visibility/services/aiVisibilityRunOutcome";
++import {
++  settleAiRun,
++  type AiPostedHold,
++} from "@/server/features/ai-visibility/services/aiVisibilityBilling";
++import { runAiResearchSetup } from "@/server/features/ai-visibility/services/aiResearchKeywords";
++import type { BillingCustomerContext } from "@/server/billing/subscription";
++import { AI_TRACKING_HOLD_TTL_MS } from "@/server/lib/dataforseo";
++import { describeError } from "@/server/lib/errors";
++
++// One binding serves answer collection runs and the one-time research setup,
++// so setup needs no new workflow infrastructure.
++type AiVisibilityPayload = (
++  | { runId: string }
++  | { setupProjectId: string; runSeededTracking?: boolean }
++) & {
++  customer: BillingCustomerContext;
++};
++
++// Metered and paid steps run once: a retry could post (and bill) twice.
++const SINGLE_ATTEMPT = {
++  retries: { limit: 0, delay: "1 second" as const },
++  timeout: "2 minutes" as const,
++};
++// Steps that only read and write our own rows are free and safe to repeat, so
++// an engine failure on one attempt does not fail the run.
++const FREE_STEP = {
++  retries: { limit: 2, delay: "10 seconds" as const },
++  timeout: "2 minutes" as const,
++};
++// task_get is free and saving an answer replaces its evidence, so collect
++// steps can retry.
++const COLLECT_STEP = {
++  retries: { limit: 2, delay: "10 seconds" as const },
++  timeout: "5 minutes" as const,
++};
++// Live answers are billed per call, so a live step runs once too. It waits for
++// up to 6 answers, each up to 120 seconds, and asks a failed answer up to 3
++// times.
++const LIVE_STEP = { ...SINGLE_ATTEMPT, timeout: "10 minutes" as const };
++// Standard-queue answers usually arrive within minutes. Cumulative waits are
++// 2 / 4 / 7 / 10 / 14 / 18 / 22 / 26 / 30 minutes; anything still missing then
++// fails as not collected, until a late read finds it. Each sleep stays under 5
++// minutes, like rank check's: the engine cancels an invocation idling in a
++// longer sleep.
++const POLL_INTERVALS = [
++  "2 minutes",
++  "2 minutes",
++  "3 minutes",
++  "3 minutes",
++  "4 minutes",
++  "4 minutes",
++  "4 minutes",
++  "4 minutes",
++  "4 minutes",
++] as const;
++// After the run finishes, answers DataForSEO has not returned yet are read
++// every 30 minutes, so a provider delay fills the run in late without holding
++// up the tracker. Reads stop an hour before the credit hold expires, which
++// leaves time to settle it; the hold starts after the workflow does.
++const LATE_READ_INTERVAL_MS = 30 * 60_000;
++const LATE_READS_FOR_MS = AI_TRACKING_HOLD_TTL_MS - 60 * 60_000;
++
++export class AiVisibilityWorkflow extends WorkflowEntrypoint<
++  Env,
++  AiVisibilityPayload
++> {
++  async run(
++    event: WorkflowEvent<AiVisibilityPayload>,
++    engineStep: WorkflowStep,
++  ) {
++    const step = yieldingStep(engineStep);
++    const { payload } = event;
++    if ("setupProjectId" in payload)
++      // No retries: each attempt is a paid model call. The user can retry.
++      return pgStep(
++        step,
++        "research-setup",
++        { retries: { limit: 0, delay: "1 second" }, timeout: "5 minutes" },
++        () =>
++          runAiResearchSetup(
++            { projectId: payload.setupProjectId },
++            payload.customer,
++            { runSeededTracking: payload.runSeededTracking },
++          ),
++      );
++    const { runId, customer } = payload;
++    let pending: AiPendingTask[] = [];
++    // Each posted batch holds credits until settle charges the answers that
++    // arrived, once late reads end or the run fails.
++    const holds: AiPostedHold[] = [];
++    // A run in flight across the deploy that added holds replays an older
++    // post output, the bare task list, which was charged when posted.
++    const queue = (posted: Awaited<ReturnType<typeof postAiBatch>>) => {
++      if (Array.isArray(posted)) return pending.push(...posted);
++      if (posted.hold) holds.push(posted.hold);
++      pending.push(...posted.pending);
++    };
++    const settle = async () => {
++      if (holds.length === 0) return;
++      const posted = holds.splice(0);
++      try {
++        // Safe to retry: Autumn settles a hold once, then forgets its lock.
++        await pgStep(step, "settle", FREE_STEP, () =>
++          settleAiRun(runId, customer, posted),
++        );
++      } catch (error) {
++        // A hold left open expires at its TTL without charging.
++        console.error(
++          `[ai-visibility] ${runId} settle failed: ${describeError(error)}`,
++          error,
++        );
++      }
++    };
++    const markFailed = async (error: unknown) => {
++      await settle();
++      await pgStep(step, "mark-failed", FREE_STEP, () =>
++        markAiRunFailed(runId),
++      );
++      throw error;
++    };
++    const failRun = (error: unknown) => {
++      console.error(
++        `[ai-visibility] ${runId} failed: ${describeError(error)}`,
++        error,
++      );
++      return markFailed(error);
++    };
++    let plan: Awaited<ReturnType<typeof prepareAiRun>>;
++    // Reads the pending answers once, then posts each answer that DataForSEO's
++    // backend failed again in its own step, since a post is billed. The read
++    // steps are `read-*`, not the older `collect-*`: a run in flight across a
++    // deploy must not replay a `collect-*` output, which had another shape.
++    const collect = async (name: string, canRetry: boolean) => {
++      const remaining = pending;
++      let round: Awaited<ReturnType<typeof collectAiRound>>;
++      try {
++        round = await pgStep(step, `read-${name}`, COLLECT_STEP, () =>
++          collectAiRound(runId, remaining, canRetry),
++        );
++      } catch (error) {
++        // Posted tasks keep their credit hold; poll them again next round.
++        console.warn(
++          `[ai-visibility] ${runId} read-${name}: ${describeError(error)}`,
++        );
++        return;
++      }
++      pending = round.pending;
++      for (const [index, batch] of round.retry.entries()) {
++        try {
++          queue(
++            await pgStep(step, `repost-${name}-${index}`, SINGLE_ATTEMPT, () =>
++              postAiBatch(runId, customer, plan.market, batch),
++            ),
++          );
++        } catch (error) {
++          // Its answers fail at finalize.
++          console.warn(
++            `[ai-visibility] ${runId} repost-${name}: ${describeError(error)}`,
++          );
++        }
++      }
++    };
++    try {
++      plan = await pgStep(step, "prepare", FREE_STEP, () =>
++        prepareAiRun(runId),
++      );
++    } catch (error) {
++      return failRun(error);
++    }
++    // A batch whose step fails, on the engine's own error or a timeout, leaves
++    // its answers pending for finalize to fail. The other batches still run,
++    // so the run keeps every answer it got.
++    if (plan.live)
++      // Live runs save each live batch as it returns, so nothing is left
++      // pending to poll.
++      for (const [index, tasks] of plan.batches.entries())
++        try {
++          await pgStep(step, `live-${index}`, LIVE_STEP, () =>
++            collectAiLiveBatch(runId, customer, plan.market, tasks),
++          );
++        } catch (error) {
++          console.warn(
++            `[ai-visibility] ${runId} live-${index}: ${describeError(error)}`,
++          );
++        }
++    else
++      for (const [index, batch] of plan.batches.entries())
++        try {
++          queue(
++            await pgStep(step, `post-${index}`, SINGLE_ATTEMPT, () =>
++              postAiBatch(runId, customer, plan.market, batch),
++            ),
++          );
++        } catch (error) {
++          console.warn(
++            `[ai-visibility] ${runId} post-${index}: ${describeError(error)}`,
++          );
++        }
++    // Claude and Perplexity answers come from the model API on every run.
++    // Queued answers process meanwhile, and each model batch is followed by
++    // one free read of them.
++    for (const [index, batch] of plan.modelBatches.entries()) {
++      try {
++        await pgStep(step, `model-${index}`, LIVE_STEP, () =>
++          collectAiModelBatch(runId, customer, plan.market, batch),
++        );
++      } catch (error) {
++        // Its unsaved answers fail at finalize; the other batches continue.
++        console.warn(
++          `[ai-visibility] ${runId} model-${index}: ${describeError(error)}`,
++        );
++      }
++      if (pending.length) await collect(`model-${index}`, true);
++    }
++    for (
++      let round = 0;
++      round < POLL_INTERVALS.length && pending.length > 0;
++      round++
++    ) {
++      try {
++        await step.sleep(`wait-${round}`, POLL_INTERVALS[round]);
++      } catch (error) {
++        // The engine cancels an invocation idling in a long sleep, which
++        // rejects it here, then resumes the instance on wake. That interrupt
++        // never runs mark-failed, so only a real failure fails the run. Don't
++        // log it as one.
++        return markFailed(error);
++      }
++      // A task posted after the last round would never be read.
++      await collect(`${round}`, round < POLL_INTERVALS.length - 1);
++    }
++    let finishedAt: number;
++    try {
++      finishedAt = await pgStep(step, "finalize", FREE_STEP, async () => {
++        await finalizeAiRun(runId);
++        return Date.now();
++      });
++    } catch (error) {
++      return failRun(error);
++    }
++    const lateUntil = event.timestamp.getTime() + LATE_READS_FOR_MS;
++    for (let round = 1; pending.length > 0; round++) {
++      const wakeAt = finishedAt + round * LATE_READ_INTERVAL_MS;
++      if (wakeAt > lateUntil) break;
++      // Uncaught: the engine cancels an invocation idling this long and
++      // resumes the instance on wake, so the rejection is no failure, and
++      // settling here would charge before late answers arrive.
++      await step.sleepUntil(`late-wait-${round}`, wakeAt);
++      try {
++        pending = await pgStep(step, `late-${round}`, COLLECT_STEP, () =>
++          collectLateAiAnswers(runId, pending),
++        );
++      } catch (error) {
++        // Read again next round.
++        console.warn(
++          `[ai-visibility] ${runId} late-${round}: ${describeError(error)}`,
++        );
++      }
++    }
++    await settle();
++  }
++}
+diff --git a/src/server/workflows/LocalRankWorkflow.ts b/src/server/workflows/LocalRankWorkflow.ts
+index 91ee262..ef1aa7d 100644
+--- a/src/server/workflows/LocalRankWorkflow.ts
++++ b/src/server/workflows/LocalRankWorkflow.ts
+@@ -3,81 +3,21 @@ import {
+   type WorkflowEvent,
+   type WorkflowStep,
+ } from "cloudflare:workers";
+-import type { BillingCustomerContext } from "@/server/billing/subscription";
+-import {
+-  failLocalPoints,
+-  finalizeLocalCheck,
+-  prepareLocalCheck,
+-  searchLocalPoints,
+-} from "@/server/features/local-seo/services/localSeoCollection";
+-import { pgStep } from "./pgStep";
+-import { yieldingStep } from "./yieldingStep";
+-import { describeError } from "@/server/lib/errors";
+-
+-type LocalRankPayload = {
+-  checkId: string;
+-  customer: BillingCustomerContext;
+-};
+-const ONCE = {
+-  retries: { limit: 0, delay: "1 second" as const },
+-  timeout: "2 minutes" as const,
+-};
+-// A Worker keeps six outbound connections open at once, so one step's live
+-// searches run in a single wave (~3-5 s each).
+-const SEARCHES_PER_STEP = 6;
+ 
+-export class LocalRankWorkflow extends WorkflowEntrypoint<
+-  Env,
+-  LocalRankPayload
+-> {
+-  async run(event: WorkflowEvent<LocalRankPayload>, engineStep: WorkflowStep) {
+-    const step = yieldingStep(engineStep);
+-    const { checkId, customer } = event.payload;
+-    const projectId = customer.projectId;
+-    if (!projectId) return;
+-    try {
+-      const plans = await pgStep(step, "prepare", undefined, () =>
+-        prepareLocalCheck(projectId, checkId),
+-      );
+-      for (const plan of plans) {
+-        for (
+-          let offset = 0;
+-          offset < plan.points.length;
+-          offset += SEARCHES_PER_STEP
+-        ) {
+-          const points = plan.points.slice(offset, offset + SEARCHES_PER_STEP);
+-          try {
+-            // Paid searches run once; a failed step fails its points instead
+-            // of buying the same searches again.
+-            await pgStep(step, `search-${plan.scanId}-${offset}`, ONCE, () =>
+-              searchLocalPoints(plan, points, customer),
+-            );
+-          } catch (error) {
+-            console.error(
+-              `[local-seo] keyword ${plan.scanId} points ${offset}+ failed:`,
+-              error,
+-            );
+-            await pgStep(step, `fail-${plan.scanId}-${offset}`, undefined, () =>
+-              failLocalPoints(points),
+-            );
+-          }
+-        }
+-      }
+-      await pgStep(step, "complete", undefined, () =>
+-        finalizeLocalCheck(projectId, checkId),
+-      );
+-    } catch (error) {
+-      console.error(
+-        `[local-seo] check ${checkId} failed: ${describeError(error)}`,
+-        error,
+-      );
+-      await pgStep(step, "fail", undefined, () =>
+-        finalizeLocalCheck(
+-          projectId,
+-          checkId,
+-          "The check could not finish. Saved points remain available. Submitted searches may still use credits.",
+-        ),
+-      );
+-    }
++/**
++ * Lazy entry for the local-rank workflow. The runtime loads this class by
++ * name at Worker startup, but the workflow implementation is only needed once
++ * an instance runs. Keep the class name and the `run` signature: the wrapper
++ * forwards the same event and step unchanged.
++ */
++export class LocalRankWorkflow extends WorkflowEntrypoint<Env, unknown> {
++  async run(
++    event: WorkflowEvent<unknown>,
++    step: WorkflowStep,
++  ): Promise<unknown> {
++    const { LocalRankWorkflow: Impl } = await import(
++      "./LocalRankWorkflowImpl"
++    );
++    return new Impl(this.ctx, this.env).run(event as never, step);
+   }
+ }
+diff --git a/src/server/workflows/LocalRankWorkflowImpl.ts b/src/server/workflows/LocalRankWorkflowImpl.ts
+new file mode 100644
+index 0000000..91ee262
+--- /dev/null
++++ b/src/server/workflows/LocalRankWorkflowImpl.ts
+@@ -0,0 +1,83 @@
++import {
++  WorkflowEntrypoint,
++  type WorkflowEvent,
++  type WorkflowStep,
++} from "cloudflare:workers";
++import type { BillingCustomerContext } from "@/server/billing/subscription";
++import {
++  failLocalPoints,
++  finalizeLocalCheck,
++  prepareLocalCheck,
++  searchLocalPoints,
++} from "@/server/features/local-seo/services/localSeoCollection";
++import { pgStep } from "./pgStep";
++import { yieldingStep } from "./yieldingStep";
++import { describeError } from "@/server/lib/errors";
++
++type LocalRankPayload = {
++  checkId: string;
++  customer: BillingCustomerContext;
++};
++const ONCE = {
++  retries: { limit: 0, delay: "1 second" as const },
++  timeout: "2 minutes" as const,
++};
++// A Worker keeps six outbound connections open at once, so one step's live
++// searches run in a single wave (~3-5 s each).
++const SEARCHES_PER_STEP = 6;
++
++export class LocalRankWorkflow extends WorkflowEntrypoint<
++  Env,
++  LocalRankPayload
++> {
++  async run(event: WorkflowEvent<LocalRankPayload>, engineStep: WorkflowStep) {
++    const step = yieldingStep(engineStep);
++    const { checkId, customer } = event.payload;
++    const projectId = customer.projectId;
++    if (!projectId) return;
++    try {
++      const plans = await pgStep(step, "prepare", undefined, () =>
++        prepareLocalCheck(projectId, checkId),
++      );
++      for (const plan of plans) {
++        for (
++          let offset = 0;
++          offset < plan.points.length;
++          offset += SEARCHES_PER_STEP
++        ) {
++          const points = plan.points.slice(offset, offset + SEARCHES_PER_STEP);
++          try {
++            // Paid searches run once; a failed step fails its points instead
++            // of buying the same searches again.
++            await pgStep(step, `search-${plan.scanId}-${offset}`, ONCE, () =>
++              searchLocalPoints(plan, points, customer),
++            );
++          } catch (error) {
++            console.error(
++              `[local-seo] keyword ${plan.scanId} points ${offset}+ failed:`,
++              error,
++            );
++            await pgStep(step, `fail-${plan.scanId}-${offset}`, undefined, () =>
++              failLocalPoints(points),
++            );
++          }
++        }
++      }
++      await pgStep(step, "complete", undefined, () =>
++        finalizeLocalCheck(projectId, checkId),
++      );
++    } catch (error) {
++      console.error(
++        `[local-seo] check ${checkId} failed: ${describeError(error)}`,
++        error,
++      );
++      await pgStep(step, "fail", undefined, () =>
++        finalizeLocalCheck(
++          projectId,
++          checkId,
++          "The check could not finish. Saved points remain available. Submitted searches may still use credits.",
++        ),
++      );
++    }
++  }
++}
+diff --git a/src/server/workflows/RankCheckWorkflow.ts b/src/server/workflows/RankCheckWorkflow.ts
+index dd5102a..6f01f4e 100644
+--- a/src/server/workflows/RankCheckWorkflow.ts
++++ b/src/server/workflows/RankCheckWorkflow.ts
+@@ -3,483 +3,21 @@ import {
+   type WorkflowEvent,
+   type WorkflowStep,
+ } from "cloudflare:workers";
+-import { NonRetryableError } from "cloudflare:workflows";
+-import { withPgClient } from "@/db";
+-import { yieldingStep } from "@/server/workflows/yieldingStep";
+-import type { BillingCustomerContext } from "@/server/billing/subscription";
+-import { RankTrackingRepository } from "@/server/features/rank-tracking/repositories/RankTrackingRepository";
+-import { failRunIfActive } from "@/server/features/rank-tracking/services/rankCheckRunGuards";
+-import {
+-  runLiveCheck,
+-  runQueuedCheck,
+-} from "@/server/workflows/rankCheckPaths";
+-import { retryRankChecks } from "@/server/workflows/rankCheckRetries";
+-import { resolveRunGotoUrls } from "@/server/workflows/rankCheckGotoUrls";
+-import { pgStep } from "@/server/workflows/pgStep";
+-import { createDataforseoClient } from "@/server/lib/dataforseo";
+-import { captureServerEvent } from "@/server/lib/posthog";
+-import { sendCreditsExhaustedEvent } from "@/server/email/onboarding-drip";
+-import { describeError } from "@/server/lib/errors";
+-import { autumn } from "@/server/billing/autumn";
+-import {
+-  AUTUMN_SEO_DATA_BALANCE_FEATURE_ID,
+-  AUTUMN_SEO_DATA_TOPUP_BALANCE_FEATURE_ID,
+-} from "@/shared/billing";
+-import {
+-  estimateRankCheckCredits,
+-  rankCheckCostApprovalError,
+-} from "@/shared/rank-tracking";
+-import { isHostedServerAuthMode } from "@/server/lib/runtime-env";
+-import { isErrorCode } from "@/shared/error-codes";
+-
+-// These steps cost nothing and are safe to repeat: they touch our own rows,
+-// prepare's Autumn calls only read balances, and its credits email is sent
+-// once a day. So an engine failure on one attempt does not fail the run. The
+-// paid batch steps live in rankCheckPaths and run once.
+-const FREE_STEP_CONFIG = {
+-  retries: { limit: 2, delay: "10 seconds" as const },
+-  timeout: "2 minutes" as const,
+-};
+-
+-interface RankCheckParams {
+-  runId: string;
+-  configId: string;
+-  billingCustomer: BillingCustomerContext;
+-  projectId: string;
+-  domain: string;
+-  locationCode: number;
+-  languageCode: string;
+-  locationName?: string;
+-  devices: "both" | "desktop" | "mobile";
+-  serpDepth: number;
+-  trigger: "manual" | "scheduled";
+-  keywordIds?: string[];
+-  maxCostCredits?: number;
+-}
+-
+-async function prepareRankCheckKeywords(input: {
+-  runId: string;
+-  configId: string;
+-  billingCustomer: BillingCustomerContext;
+-  devices: RankCheckParams["devices"];
+-  serpDepth: number;
+-  trigger: RankCheckParams["trigger"];
+-  keywordIds?: string[];
+-  maxCostCredits?: number;
+-}) {
+-  // If stale-cleanup marked our run failed before we got here, bail out
+-  // rather than resurrecting a superseded run.
+-  const run = await RankTrackingRepository.getRunById(input.runId);
+-  if (!run || run.status === "failed" || run.status === "completed") {
+-    throw new NonRetryableError(
+-      `Run ${input.runId} is no longer active (status=${run?.status ?? "missing"})`,
+-    );
+-  }
+-
+-  await RankTrackingRepository.updateRun(input.runId, {
+-    status: "running",
+-  });
+-
+-  let trackingKeywords = await RankTrackingRepository.getKeywordsForConfig(
+-    input.configId,
+-  );
+-
+-  if (input.keywordIds && input.keywordIds.length > 0) {
+-    const idSet = new Set(input.keywordIds);
+-    trackingKeywords = trackingKeywords.filter((kw) => idSet.has(kw.id));
+-  }
+-
+-  // Refusals are not retried: a retry would only repeat them, and send the
+-  // credits email again.
+-  if (trackingKeywords.length === 0) {
+-    throw new NonRetryableError("No keywords to track");
+-  }
+-
+-  const { costCredits } = estimateRankCheckCredits(
+-    trackingKeywords.map((kw) => kw.keyword),
+-    input.devices,
+-    input.serpDepth,
+-    input.trigger === "scheduled" ? "queued" : "live",
+-  );
+-  if (input.maxCostCredits != null && costCredits > input.maxCostCredits) {
+-    throw new NonRetryableError(
+-      rankCheckCostApprovalError(costCredits, input.maxCostCredits),
+-    );
+-  }
+-
+-  // Verify the user has enough credits for the full check before starting.
+-  // Scheduled checks go through the cheaper task queue, so estimate at queued
+-  // pricing — a live-price estimate would skip checks the user can afford.
+-  // The estimate is the worst case, so it covers every retry.
+-  if (await isHostedServerAuthMode()) {
+-    const [monthlyCheck, topupCheck] = await Promise.all([
+-      autumn.check({
+-        customerId: input.billingCustomer.organizationId,
+-        featureId: AUTUMN_SEO_DATA_BALANCE_FEATURE_ID,
+-      }),
+-      autumn.check({
+-        customerId: input.billingCustomer.organizationId,
+-        featureId: AUTUMN_SEO_DATA_TOPUP_BALANCE_FEATURE_ID,
+-      }),
+-    ]);
+-    const available =
+-      (monthlyCheck.balance?.remaining ?? 0) +
+-      (topupCheck.balance?.remaining ?? 0);
+-    if (available < costCredits) {
+-      await sendCreditsExhaustedEvent(input.billingCustomer);
+-      // The code alone, so the run's saved error shows the credits card.
+-      throw new NonRetryableError("INSUFFICIENT_CREDITS");
+-    }
+-  }
+-
+-  await RankTrackingRepository.updateRun(input.runId, {
+-    keywordsTotal: trackingKeywords.length,
+-  });
+-
+-  return {
+-    keywords: trackingKeywords.map((kw) => ({
+-      id: kw.id,
+-      keyword: kw.keyword,
+-    })),
+-  };
+-}
+-
+-async function finalizeRankCheckRun(input: {
+-  runId: string;
+-  configId: string;
+-  projectId: string;
+-  billingCustomer: BillingCustomerContext;
+-  trigger: RankCheckParams["trigger"];
+-  devices: RankCheckParams["devices"];
+-  keywords: Array<{ id: string; keyword: string }>;
+-  batchError: string | null;
+-}) {
+-  // If stale-cleanup already marked our run failed, don't overwrite that
+-  // decision with a completed status — a replacement run may already be
+-  // underway.
+-  const run = await RankTrackingRepository.getRunById(input.runId);
+-  if (!run || run.status === "failed" || run.status === "completed") {
+-    console.warn(
+-      `[rank-check] ${input.runId} no longer active (status=${run?.status ?? "missing"}), skipping finalization`,
+-    );
+-    return;
+-  }
+-
+-  const nowIso = new Date().toISOString();
+-
+-  // Snapshots were written incrementally by each batch step. Count from the
+-  // DB: a keyword is checked when any device has a snapshot, but the run is
+-  // partial when any device is missing one, so a lost device still shows.
+-  const snapshots = await RankTrackingRepository.getSnapshotsForRun(
+-    input.runId,
+-  );
+-  const keywordsChecked = new Set(snapshots.map((s) => s.trackingKeywordId))
+-    .size;
+-  const devices: Array<"desktop" | "mobile"> =
+-    input.devices === "both" ? ["desktop", "mobile"] : [input.devices];
+-  const checkedByDevice = devices.map((device) => ({
+-    device,
+-    count: new Set(
+-      snapshots
+-        .filter((s) => s.device === device)
+-        .map((s) => s.trackingKeywordId),
+-    ).size,
+-  }));
+ 
+-  const keywordsTotal = run.keywordsTotal || keywordsChecked;
+-  const isPartial = checkedByDevice.some((d) => d.count < keywordsTotal);
+-
+-  // Batch steps record the first per-keyword rejection on the run as it
+-  // happens, so a failed run shows the vendor's reason rather than a count.
+-  const keywordError = run.errorMessage ?? input.batchError;
+-  const status =
+-    keywordsChecked === 0 && keywordsTotal > 0 ? "failed" : "completed";
+-  // A bare code (UPSTREAM_UNAVAILABLE) is for the failed-run copy to
+-  // translate; the partial message is shown as is, so it is left out there.
+-  const partialReason =
+-    keywordError && !isErrorCode(keywordError) ? keywordError : null;
+-  const checkedSummary =
+-    checkedByDevice.length > 1
+-      ? checkedByDevice
+-          .map(({ device, count }) => `${count} of ${keywordsTotal} ${device}`)
+-          .join(" and ")
+-      : `${keywordsChecked} of ${keywordsTotal}`;
+-  const errorMessage =
+-    status === "failed"
+-      ? (keywordError ?? "No keywords could be checked.")
+-      : isPartial
+-        ? [
+-            `Checked ${checkedSummary} keyword(s)${partialReason ? `: ${partialReason}` : ""}`.replace(
+-              /\.?$/,
+-              ".",
+-            ),
+-            describeUnchecked(input.keywords, devices, snapshots),
+-          ]
+-            .filter(Boolean)
+-            .join(" ")
+-        : null;
+-
+-  // Flipping status away from 'pending'/'running' is what releases the
+-  // partial-index slot for the next run.
+-  await RankTrackingRepository.updateRun(input.runId, {
+-    status,
+-    keywordsChecked,
+-    completedAt: nowIso,
+-    errorMessage,
+-  });
+-
+-  // Clear any previous skip reason on success. A failed run must not advance
+-  // lastCheckedAt — nothing was actually checked.
+-  // Note: nextCheckAt is NOT set here — the cron handler advances it eagerly
+-  // before starting the workflow to prevent retry storms.
+-  if (status === "completed") {
+-    await RankTrackingRepository.updateConfig(input.configId, input.projectId, {
+-      lastCheckedAt: nowIso,
+-      lastSkipReason: null,
+-    });
+-  }
+-
+-  // One-line summary per run, visible in Workers Logs.
+-  // Error text can echo vendor/user content — keep it one line and bounded.
+-  const errorSummary = errorMessage
+-    ? ` error="${errorMessage.replace(/\s+/g, " ").slice(0, 200)}"`
+-    : "";
+-  console.log(
+-    `[rank-check] ${input.runId} ${status} org=${input.billingCustomer.organizationId} project=${input.projectId} trigger=${input.trigger} keywords=${keywordsChecked}/${keywordsTotal}${errorSummary}`,
+-  );
+-
+-  await captureServerEvent({
+-    distinctId: input.billingCustomer.userId,
+-    event: "rank_tracking:check_complete",
+-    organizationId: input.billingCustomer.organizationId,
+-    properties: {
+-      project_id: input.projectId,
+-      status,
+-      trigger: input.trigger,
+-      keywords_checked: keywordsChecked,
+-    },
+-  });
+-}
+-
+-/** Names a partial run's unchecked keywords, so users see which ones failed. */
+-function describeUnchecked(
+-  keywords: Array<{ id: string; keyword: string }>,
+-  devices: Array<"desktop" | "mobile">,
+-  snapshots: Array<{ trackingKeywordId: string; device: string }>,
+-) {
+-  const checked = new Set(
+-    snapshots.map((s) => `${s.trackingKeywordId}:${s.device}`),
+-  );
+-  const unchecked = keywords.flatMap((kw) => {
+-    const missing = devices.filter((d) => !checked.has(`${kw.id}:${d}`));
+-    if (missing.length === 0) return [];
+-    // Name the device only when the other one got a result.
+-    return missing.length < devices.length
+-      ? [`"${kw.keyword}" (${missing[0]})`]
+-      : [`"${kw.keyword}"`];
+-  });
+-  if (unchecked.length === 0) return "";
+-  const shown = unchecked.slice(0, UNCHECKED_KEYWORDS_SHOWN).join(", ");
+-  const more = unchecked.length - UNCHECKED_KEYWORDS_SHOWN;
+-  return `Not checked: ${shown}${more > 0 ? ` and ${more} more` : ""}.`;
+-}
+-
+-/** Keeps a partial run's message readable on a large tracker. */
+-const UNCHECKED_KEYWORDS_SHOWN = 10;
+-
+-async function markRankCheckRunFailed(input: {
+-  runId: string;
+-  configId: string;
+-  projectId: string;
+-  billingCustomer: BillingCustomerContext;
+-  error: unknown;
+-}) {
+-  // run() catches the error the engine rebuilt from the failed step, never
+-  // the thrown object, with the message prefixed by the error's name. A
+-  // refusal's bare code under that prefix is what the run keeps, so the
+-  // credits card shows and the config can say why the check was skipped.
+-  const message =
+-    input.error instanceof Error ? input.error.message : "Unknown error";
+-  const bare = message.replace(/^\w+: /, "");
+-  const refusal = isErrorCode(bare) ? bare : null;
+-  await failRunIfActive(input.runId, refusal ?? message);
+-
+-  if (refusal === "INSUFFICIENT_CREDITS") {
+-    await RankTrackingRepository.updateConfig(input.configId, input.projectId, {
+-      lastSkipReason: "insufficient_credits",
+-    });
+-  }
+-
+-  await captureServerEvent({
+-    distinctId: input.billingCustomer.userId,
+-    event: "rank_tracking:check_complete",
+-    organizationId: input.billingCustomer.organizationId,
+-    properties: {
+-      project_id: input.projectId,
+-      status: "failed",
+-      // A code, not the message: provider errors can quote keywords or domains.
+-      error_code: refusal ?? "INTERNAL_ERROR",
+-    },
+-  });
+-}
+-
+-export class RankCheckWorkflow extends WorkflowEntrypoint<
+-  Env,
+-  RankCheckParams
+-> {
+-  async run(event: WorkflowEvent<RankCheckParams>, step: WorkflowStep) {
+-    // Scope a per-request Postgres client for this workflow invocation (no-op in
+-    // D1 mode). The socket is reclaimed when the invocation ends, so there is
+-    // nothing to tear down here.
+-    return withPgClient(() => this.runScoped(event, yieldingStep(step)));
+-  }
+-
+-  private async runScoped(
+-    event: WorkflowEvent<RankCheckParams>,
++/**
++ * Lazy entry for the rank-check workflow. The runtime loads this class by
++ * name at Worker startup, but the workflow implementation is only needed once
++ * an instance runs. Keep the class name and the `run` signature: the wrapper
++ * forwards the same event and step unchanged.
++ */
++export class RankCheckWorkflow extends WorkflowEntrypoint<Env, unknown> {
++  async run(
++    event: WorkflowEvent<unknown>,
+     step: WorkflowStep,
+-  ) {
+-    const {
+-      runId,
+-      configId,
+-      billingCustomer,
+-      projectId,
+-      domain,
+-      locationCode,
+-      languageCode,
+-      locationName,
+-      devices,
+-      serpDepth,
+-      trigger,
+-      keywordIds,
+-      maxCostCredits,
+-    } = event.payload;
+-
+-    // Guard: skip if config was archived after the workflow was triggered
+-    const configCheck = await pgStep(
+-      step,
+-      "check-active",
+-      FREE_STEP_CONFIG,
+-      async () => {
+-        const cfg = await RankTrackingRepository.getConfigById({
+-          configId,
+-          projectId,
+-        });
+-        return { isActive: cfg?.isActive ?? false };
+-      },
++  ): Promise<unknown> {
++    const { RankCheckWorkflow: Impl } = await import(
++      "./RankCheckWorkflowImpl"
+     );
+-    if (!configCheck.isActive) {
+-      await failRunIfActive(runId, "Config has been archived");
+-      return;
+-    }
+-
+-    try {
+-      console.log(
+-        `[rank-check] ${runId} starting (trigger=${trigger}, devices=${devices})`,
+-      );
+-
+-      const prepareResult = await pgStep(
+-        step,
+-        "prepare",
+-        FREE_STEP_CONFIG,
+-        async () =>
+-          prepareRankCheckKeywords({
+-            runId,
+-            configId,
+-            billingCustomer,
+-            devices,
+-            serpDepth,
+-            trigger,
+-            keywordIds,
+-            maxCostCredits,
+-          }),
+-      );
+-
+-      const keywords = prepareResult.keywords;
+-      const client = createDataforseoClient(billingCustomer);
+-
+-      console.log(`[rank-check] ${runId} loaded ${keywords.length} keywords`);
+-
+-      let batchError: string | null = null;
+-
+-      try {
+-        const checkContext = {
+-          client,
+-          keywords,
+-          devices,
+-          serpDepth,
+-          domain,
+-          locationCode,
+-          languageCode,
+-          locationName,
+-          runId,
+-        };
+-        // Scheduled checks use DataForSEO's task queue (~30% of live cost);
+-        // manual checks stay on the live endpoint for instant results.
+-        // Retries always go through the queue.
+-        if (trigger === "scheduled") {
+-          await runQueuedCheck(step, checkContext);
+-        } else {
+-          await runLiveCheck(step, checkContext);
+-        }
+-        await retryRankChecks(step, checkContext, configId, trigger);
+-      } catch (error) {
+-        // Batch failure — snapshots for completed batches are already
+-        // persisted incrementally. Continue to finalization.
+-        batchError = error instanceof Error ? error.message : String(error);
+-        console.warn(`[rank-check] ${runId} partial failure: ${batchError}`);
+-      }
+-
+-      try {
+-        await pgStep(step, "resolve-goto-urls", FREE_STEP_CONFIG, () =>
+-          resolveRunGotoUrls(runId),
+-        );
+-      } catch (error) {
+-        // The positions are saved and the goto links still work, so this
+-        // doesn't fail the run.
+-        console.warn(
+-          `[rank-check] ${runId} goto URLs not resolved: ${describeError(error)}`,
+-        );
+-      }
+-
+-      await pgStep(step, "finalize", FREE_STEP_CONFIG, async () =>
+-        finalizeRankCheckRun({
+-          runId,
+-          configId,
+-          projectId,
+-          billingCustomer,
+-          trigger,
+-          devices,
+-          keywords,
+-          batchError,
+-        }),
+-      );
+-    } catch (error) {
+-      // Cloudflare resets the Workflow's Durable Object on a deploy or its own
+-      // restarts. The engine replays the run from its last finished step and
+-      // it completes normally, so this is a warning, not a failure.
+-      if (
+-        error instanceof Error &&
+-        error.message.includes("Durable Object reset because its code")
+-      ) {
+-        console.warn(`Rank check ${runId} interrupted: ${error.message}`);
+-      } else {
+-        console.error(
+-          `Rank check ${runId} failed: ${describeError(error)}`,
+-          error,
+-        );
+-      }
+-      // A retry after the body finished (an engine storage failure) sends the
+-      // failed event again; harmless.
+-      await pgStep(step, "mark-failed", FREE_STEP_CONFIG, async () =>
+-        markRankCheckRunFailed({
+-          runId,
+-          configId,
+-          projectId,
+-          billingCustomer,
+-          error,
+-        }),
+-      );
+-      throw error;
+-    }
++    return new Impl(this.ctx, this.env).run(event as never, step);
+   }
+ }
+diff --git a/src/server/workflows/RankCheckWorkflowImpl.ts b/src/server/workflows/RankCheckWorkflowImpl.ts
+new file mode 100644
+index 0000000..dd5102a
+--- /dev/null
++++ b/src/server/workflows/RankCheckWorkflowImpl.ts
+@@ -0,0 +1,485 @@
++import {
++  WorkflowEntrypoint,
++  type WorkflowEvent,
++  type WorkflowStep,
++} from "cloudflare:workers";
++import { NonRetryableError } from "cloudflare:workflows";
++import { withPgClient } from "@/db";
++import { yieldingStep } from "@/server/workflows/yieldingStep";
++import type { BillingCustomerContext } from "@/server/billing/subscription";
++import { RankTrackingRepository } from "@/server/features/rank-tracking/repositories/RankTrackingRepository";
++import { failRunIfActive } from "@/server/features/rank-tracking/services/rankCheckRunGuards";
++import {
++  runLiveCheck,
++  runQueuedCheck,
++} from "@/server/workflows/rankCheckPaths";
++import { retryRankChecks } from "@/server/workflows/rankCheckRetries";
++import { resolveRunGotoUrls } from "@/server/workflows/rankCheckGotoUrls";
++import { pgStep } from "@/server/workflows/pgStep";
++import { createDataforseoClient } from "@/server/lib/dataforseo";
++import { captureServerEvent } from "@/server/lib/posthog";
++import { sendCreditsExhaustedEvent } from "@/server/email/onboarding-drip";
++import { describeError } from "@/server/lib/errors";
++import { autumn } from "@/server/billing/autumn";
++import {
++  AUTUMN_SEO_DATA_BALANCE_FEATURE_ID,
++  AUTUMN_SEO_DATA_TOPUP_BALANCE_FEATURE_ID,
++} from "@/shared/billing";
++import {
++  estimateRankCheckCredits,
++  rankCheckCostApprovalError,
++} from "@/shared/rank-tracking";
++import { isHostedServerAuthMode } from "@/server/lib/runtime-env";
++import { isErrorCode } from "@/shared/error-codes";
++
++// These steps cost nothing and are safe to repeat: they touch our own rows,
++// prepare's Autumn calls only read balances, and its credits email is sent
++// once a day. So an engine failure on one attempt does not fail the run. The
++// paid batch steps live in rankCheckPaths and run once.
++const FREE_STEP_CONFIG = {
++  retries: { limit: 2, delay: "10 seconds" as const },
++  timeout: "2 minutes" as const,
++};
++
++interface RankCheckParams {
++  runId: string;
++  configId: string;
++  billingCustomer: BillingCustomerContext;
++  projectId: string;
++  domain: string;
++  locationCode: number;
++  languageCode: string;
++  locationName?: string;
++  devices: "both" | "desktop" | "mobile";
++  serpDepth: number;
++  trigger: "manual" | "scheduled";
++  keywordIds?: string[];
++  maxCostCredits?: number;
++}
++
++async function prepareRankCheckKeywords(input: {
++  runId: string;
++  configId: string;
++  billingCustomer: BillingCustomerContext;
++  devices: RankCheckParams["devices"];
++  serpDepth: number;
++  trigger: RankCheckParams["trigger"];
++  keywordIds?: string[];
++  maxCostCredits?: number;
++}) {
++  // If stale-cleanup marked our run failed before we got here, bail out
++  // rather than resurrecting a superseded run.
++  const run = await RankTrackingRepository.getRunById(input.runId);
++  if (!run || run.status === "failed" || run.status === "completed") {
++    throw new NonRetryableError(
++      `Run ${input.runId} is no longer active (status=${run?.status ?? "missing"})`,
++    );
++  }
++
++  await RankTrackingRepository.updateRun(input.runId, {
++    status: "running",
++  });
++
++  let trackingKeywords = await RankTrackingRepository.getKeywordsForConfig(
++    input.configId,
++  );
++
++  if (input.keywordIds && input.keywordIds.length > 0) {
++    const idSet = new Set(input.keywordIds);
++    trackingKeywords = trackingKeywords.filter((kw) => idSet.has(kw.id));
++  }
++
++  // Refusals are not retried: a retry would only repeat them, and send the
++  // credits email again.
++  if (trackingKeywords.length === 0) {
++    throw new NonRetryableError("No keywords to track");
++  }
++
++  const { costCredits } = estimateRankCheckCredits(
++    trackingKeywords.map((kw) => kw.keyword),
++    input.devices,
++    input.serpDepth,
++    input.trigger === "scheduled" ? "queued" : "live",
++  );
++  if (input.maxCostCredits != null && costCredits > input.maxCostCredits) {
++    throw new NonRetryableError(
++      rankCheckCostApprovalError(costCredits, input.maxCostCredits),
++    );
++  }
++
++  // Verify the user has enough credits for the full check before starting.
++  // Scheduled checks go through the cheaper task queue, so estimate at queued
++  // pricing — a live-price estimate would skip checks the user can afford.
++  // The estimate is the worst case, so it covers every retry.
++  if (await isHostedServerAuthMode()) {
++    const [monthlyCheck, topupCheck] = await Promise.all([
++      autumn.check({
++        customerId: input.billingCustomer.organizationId,
++        featureId: AUTUMN_SEO_DATA_BALANCE_FEATURE_ID,
++      }),
++      autumn.check({
++        customerId: input.billingCustomer.organizationId,
++        featureId: AUTUMN_SEO_DATA_TOPUP_BALANCE_FEATURE_ID,
++      }),
++    ]);
++    const available =
++      (monthlyCheck.balance?.remaining ?? 0) +
++      (topupCheck.balance?.remaining ?? 0);
++    if (available < costCredits) {
++      await sendCreditsExhaustedEvent(input.billingCustomer);
++      // The code alone, so the run's saved error shows the credits card.
++      throw new NonRetryableError("INSUFFICIENT_CREDITS");
++    }
++  }
++
++  await RankTrackingRepository.updateRun(input.runId, {
++    keywordsTotal: trackingKeywords.length,
++  });
++
++  return {
++    keywords: trackingKeywords.map((kw) => ({
++      id: kw.id,
++      keyword: kw.keyword,
++    })),
++  };
++}
++
++async function finalizeRankCheckRun(input: {
++  runId: string;
++  configId: string;
++  projectId: string;
++  billingCustomer: BillingCustomerContext;
++  trigger: RankCheckParams["trigger"];
++  devices: RankCheckParams["devices"];
++  keywords: Array<{ id: string; keyword: string }>;
++  batchError: string | null;
++}) {
++  // If stale-cleanup already marked our run failed, don't overwrite that
++  // decision with a completed status — a replacement run may already be
++  // underway.
++  const run = await RankTrackingRepository.getRunById(input.runId);
++  if (!run || run.status === "failed" || run.status === "completed") {
++    console.warn(
++      `[rank-check] ${input.runId} no longer active (status=${run?.status ?? "missing"}), skipping finalization`,
++    );
++    return;
++  }
++
++  const nowIso = new Date().toISOString();
++
++  // Snapshots were written incrementally by each batch step. Count from the
++  // DB: a keyword is checked when any device has a snapshot, but the run is
++  // partial when any device is missing one, so a lost device still shows.
++  const snapshots = await RankTrackingRepository.getSnapshotsForRun(
++    input.runId,
++  );
++  const keywordsChecked = new Set(snapshots.map((s) => s.trackingKeywordId))
++    .size;
++  const devices: Array<"desktop" | "mobile"> =
++    input.devices === "both" ? ["desktop", "mobile"] : [input.devices];
++  const checkedByDevice = devices.map((device) => ({
++    device,
++    count: new Set(
++      snapshots
++        .filter((s) => s.device === device)
++        .map((s) => s.trackingKeywordId),
++    ).size,
++  }));
++
++  const keywordsTotal = run.keywordsTotal || keywordsChecked;
++  const isPartial = checkedByDevice.some((d) => d.count < keywordsTotal);
++
++  // Batch steps record the first per-keyword rejection on the run as it
++  // happens, so a failed run shows the vendor's reason rather than a count.
++  const keywordError = run.errorMessage ?? input.batchError;
++  const status =
++    keywordsChecked === 0 && keywordsTotal > 0 ? "failed" : "completed";
++  // A bare code (UPSTREAM_UNAVAILABLE) is for the failed-run copy to
++  // translate; the partial message is shown as is, so it is left out there.
++  const partialReason =
++    keywordError && !isErrorCode(keywordError) ? keywordError : null;
++  const checkedSummary =
++    checkedByDevice.length > 1
++      ? checkedByDevice
++          .map(({ device, count }) => `${count} of ${keywordsTotal} ${device}`)
++          .join(" and ")
++      : `${keywordsChecked} of ${keywordsTotal}`;
++  const errorMessage =
++    status === "failed"
++      ? (keywordError ?? "No keywords could be checked.")
++      : isPartial
++        ? [
++            `Checked ${checkedSummary} keyword(s)${partialReason ? `: ${partialReason}` : ""}`.replace(
++              /\.?$/,
++              ".",
++            ),
++            describeUnchecked(input.keywords, devices, snapshots),
++          ]
++            .filter(Boolean)
++            .join(" ")
++        : null;
++
++  // Flipping status away from 'pending'/'running' is what releases the
++  // partial-index slot for the next run.
++  await RankTrackingRepository.updateRun(input.runId, {
++    status,
++    keywordsChecked,
++    completedAt: nowIso,
++    errorMessage,
++  });
++
++  // Clear any previous skip reason on success. A failed run must not advance
++  // lastCheckedAt — nothing was actually checked.
++  // Note: nextCheckAt is NOT set here — the cron handler advances it eagerly
++  // before starting the workflow to prevent retry storms.
++  if (status === "completed") {
++    await RankTrackingRepository.updateConfig(input.configId, input.projectId, {
++      lastCheckedAt: nowIso,
++      lastSkipReason: null,
++    });
++  }
++
++  // One-line summary per run, visible in Workers Logs.
++  // Error text can echo vendor/user content — keep it one line and bounded.
++  const errorSummary = errorMessage
++    ? ` error="${errorMessage.replace(/\s+/g, " ").slice(0, 200)}"`
++    : "";
++  console.log(
++    `[rank-check] ${input.runId} ${status} org=${input.billingCustomer.organizationId} project=${input.projectId} trigger=${input.trigger} keywords=${keywordsChecked}/${keywordsTotal}${errorSummary}`,
++  );
++
++  await captureServerEvent({
++    distinctId: input.billingCustomer.userId,
++    event: "rank_tracking:check_complete",
++    organizationId: input.billingCustomer.organizationId,
++    properties: {
++      project_id: input.projectId,
++      status,
++      trigger: input.trigger,
++      keywords_checked: keywordsChecked,
++    },
++  });
++}
++
++/** Names a partial run's unchecked keywords, so users see which ones failed. */
++function describeUnchecked(
++  keywords: Array<{ id: string; keyword: string }>,
++  devices: Array<"desktop" | "mobile">,
++  snapshots: Array<{ trackingKeywordId: string; device: string }>,
++) {
++  const checked = new Set(
++    snapshots.map((s) => `${s.trackingKeywordId}:${s.device}`),
++  );
++  const unchecked = keywords.flatMap((kw) => {
++    const missing = devices.filter((d) => !checked.has(`${kw.id}:${d}`));
++    if (missing.length === 0) return [];
++    // Name the device only when the other one got a result.
++    return missing.length < devices.length
++      ? [`"${kw.keyword}" (${missing[0]})`]
++      : [`"${kw.keyword}"`];
++  });
++  if (unchecked.length === 0) return "";
++  const shown = unchecked.slice(0, UNCHECKED_KEYWORDS_SHOWN).join(", ");
++  const more = unchecked.length - UNCHECKED_KEYWORDS_SHOWN;
++  return `Not checked: ${shown}${more > 0 ? ` and ${more} more` : ""}.`;
++}
++
++/** Keeps a partial run's message readable on a large tracker. */
++const UNCHECKED_KEYWORDS_SHOWN = 10;
++
++async function markRankCheckRunFailed(input: {
++  runId: string;
++  configId: string;
++  projectId: string;
++  billingCustomer: BillingCustomerContext;
++  error: unknown;
++}) {
++  // run() catches the error the engine rebuilt from the failed step, never
++  // the thrown object, with the message prefixed by the error's name. A
++  // refusal's bare code under that prefix is what the run keeps, so the
++  // credits card shows and the config can say why the check was skipped.
++  const message =
++    input.error instanceof Error ? input.error.message : "Unknown error";
++  const bare = message.replace(/^\w+: /, "");
++  const refusal = isErrorCode(bare) ? bare : null;
++  await failRunIfActive(input.runId, refusal ?? message);
++
++  if (refusal === "INSUFFICIENT_CREDITS") {
++    await RankTrackingRepository.updateConfig(input.configId, input.projectId, {
++      lastSkipReason: "insufficient_credits",
++    });
++  }
++
++  await captureServerEvent({
++    distinctId: input.billingCustomer.userId,
++    event: "rank_tracking:check_complete",
++    organizationId: input.billingCustomer.organizationId,
++    properties: {
++      project_id: input.projectId,
++      status: "failed",
++      // A code, not the message: provider errors can quote keywords or domains.
++      error_code: refusal ?? "INTERNAL_ERROR",
++    },
++  });
++}
++
++export class RankCheckWorkflow extends WorkflowEntrypoint<
++  Env,
++  RankCheckParams
++> {
++  async run(event: WorkflowEvent<RankCheckParams>, step: WorkflowStep) {
++    // Scope a per-request Postgres client for this workflow invocation (no-op in
++    // D1 mode). The socket is reclaimed when the invocation ends, so there is
++    // nothing to tear down here.
++    return withPgClient(() => this.runScoped(event, yieldingStep(step)));
++  }
++
++  private async runScoped(
++    event: WorkflowEvent<RankCheckParams>,
++    step: WorkflowStep,
++  ) {
++    const {
++      runId,
++      configId,
++      billingCustomer,
++      projectId,
++      domain,
++      locationCode,
++      languageCode,
++      locationName,
++      devices,
++      serpDepth,
++      trigger,
++      keywordIds,
++      maxCostCredits,
++    } = event.payload;
++
++    // Guard: skip if config was archived after the workflow was triggered
++    const configCheck = await pgStep(
++      step,
++      "check-active",
++      FREE_STEP_CONFIG,
++      async () => {
++        const cfg = await RankTrackingRepository.getConfigById({
++          configId,
++          projectId,
++        });
++        return { isActive: cfg?.isActive ?? false };
++      },
++    );
++    if (!configCheck.isActive) {
++      await failRunIfActive(runId, "Config has been archived");
++      return;
++    }
++
++    try {
++      console.log(
++        `[rank-check] ${runId} starting (trigger=${trigger}, devices=${devices})`,
++      );
++
++      const prepareResult = await pgStep(
++        step,
++        "prepare",
++        FREE_STEP_CONFIG,
++        async () =>
++          prepareRankCheckKeywords({
++            runId,
++            configId,
++            billingCustomer,
++            devices,
++            serpDepth,
++            trigger,
++            keywordIds,
++            maxCostCredits,
++          }),
++      );
++
++      const keywords = prepareResult.keywords;
++      const client = createDataforseoClient(billingCustomer);
++
++      console.log(`[rank-check] ${runId} loaded ${keywords.length} keywords`);
++
++      let batchError: string | null = null;
++
++      try {
++        const checkContext = {
++          client,
++          keywords,
++          devices,
++          serpDepth,
++          domain,
++          locationCode,
++          languageCode,
++          locationName,
++          runId,
++        };
++        // Scheduled checks use DataForSEO's task queue (~30% of live cost);
++        // manual checks stay on the live endpoint for instant results.
++        // Retries always go through the queue.
++        if (trigger === "scheduled") {
++          await runQueuedCheck(step, checkContext);
++        } else {
++          await runLiveCheck(step, checkContext);
++        }
++        await retryRankChecks(step, checkContext, configId, trigger);
++      } catch (error) {
++        // Batch failure — snapshots for completed batches are already
++        // persisted incrementally. Continue to finalization.
++        batchError = error instanceof Error ? error.message : String(error);
++        console.warn(`[rank-check] ${runId} partial failure: ${batchError}`);
++      }
++
++      try {
++        await pgStep(step, "resolve-goto-urls", FREE_STEP_CONFIG, () =>
++          resolveRunGotoUrls(runId),
++        );
++      } catch (error) {
++        // The positions are saved and the goto links still work, so this
++        // doesn't fail the run.
++        console.warn(
++          `[rank-check] ${runId} goto URLs not resolved: ${describeError(error)}`,
++        );
++      }
++
++      await pgStep(step, "finalize", FREE_STEP_CONFIG, async () =>
++        finalizeRankCheckRun({
++          runId,
++          configId,
++          projectId,
++          billingCustomer,
++          trigger,
++          devices,
++          keywords,
++          batchError,
++        }),
++      );
++    } catch (error) {
++      // Cloudflare resets the Workflow's Durable Object on a deploy or its own
++      // restarts. The engine replays the run from its last finished step and
++      // it completes normally, so this is a warning, not a failure.
++      if (
++        error instanceof Error &&
++        error.message.includes("Durable Object reset because its code")
++      ) {
++        console.warn(`Rank check ${runId} interrupted: ${error.message}`);
++      } else {
++        console.error(
++          `Rank check ${runId} failed: ${describeError(error)}`,
++          error,
++        );
++      }
++      // A retry after the body finished (an engine storage failure) sends the
++      // failed event again; harmless.
++      await pgStep(step, "mark-failed", FREE_STEP_CONFIG, async () =>
++        markRankCheckRunFailed({
++          runId,
++          configId,
++          projectId,
++          billingCustomer,
++          error,
++        }),
++      );
++      throw error;
++    }
++  }
++}

@@ -1,0 +1,492 @@
+/**
+ * Think as an orchestrator over containerized coding agents.
+ *
+ * The user chats with a `CodingOrchestrator` (a Think agent). It does not edit
+ * code itself — instead it delegates concrete tasks to `ClaudeCodeAgent`
+ * sub-agents. Each sub-agent runs as a facet whose `this.name` is the agent-tool
+ * run id, so each delegated task gets its OWN sandbox container with the repo
+ * checked out. The sub-agent's stream + progress forward to the orchestrator's
+ * UI, and it returns the diff it produced.
+ *
+ *   CodingOrchestrator (Think)  ── delegate_coding_task / delegate_parallel ──▶
+ *     ClaudeCodeAgent (AIChatAgent facet, name = runId)
+ *       └─ sandboxFor(env, orchestrator, this.name)  ──▶  one per task,
+ *          destroyed by the orchestrator when the run finishes
+ */
+
+import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
+import { getSandbox, Sandbox as BaseSandbox } from "@cloudflare/sandbox";
+import { Think, type TurnConfig } from "@cloudflare/think";
+import { callable, routeAgentRequest } from "agents";
+import {
+  agentTool,
+  type AgentToolLifecycleResult,
+  type AgentToolRunInfo
+} from "agents/agent-tools";
+import { tool, type ToolSet, type UIMessage } from "ai";
+import { z } from "zod";
+import { MAX_OUTPUT_TOKENS, runClaudeCode } from "./claude-code";
+import type { WorkspaceDiff } from "./diff";
+
+// The SDK's ContainerProxy must be exported from the Worker entry so the
+// container runtime can build outbound-interception fetchers
+// (`ctx.exports.ContainerProxy`). See the Sandbox subclass below.
+export { ContainerProxy } from "@cloudflare/sandbox";
+
+const REPO_URL = "https://github.com/threepointone/aywson";
+const WORK_DIR = "/workspace/aywson";
+
+type DelegateInput = { task: string };
+
+const ALLOWED_ANTHROPIC_ENDPOINTS = new Set([
+  "v1/messages",
+  "v1/messages/count_tokens"
+]);
+
+/**
+ * Forward the container's Anthropic egress through the AI Gateway binding.
+ *
+ * `env.AI.gateway()` is authenticated by the Worker's own account, so the
+ * container needs NO Anthropic key and NO AI Gateway token — only the gateway
+ * id (a plaintext var). Provider billing is handled by the gateway itself
+ * (Unified Billing, or a key stored in the gateway). The intercepted request's
+ * own `x-api-key` (a dummy the CLI requires) is dropped here.
+ */
+async function anthropicViaGateway(req: Request, env: Env): Promise<Response> {
+  const endpoint = new URL(req.url).pathname.replace(/^\/+/, ""); // "v1/messages"
+  // The container runs model-authored commands with internet access, so this
+  // proxy spends the account's gateway budget on its behalf. Forward only the
+  // endpoints Claude Code needs, and bound the output size of each request.
+  if (req.method !== "POST" || !ALLOWED_ANTHROPIC_ENDPOINTS.has(endpoint)) {
+    return Response.json(
+      { error: `Blocked by the Sandbox proxy: ${req.method} /${endpoint}` },
+      { status: 403 }
+    );
+  }
+  let body: Record<string, unknown>;
+  try {
+    body = (await req.json()) as Record<string, unknown>;
+  } catch {
+    return Response.json({ error: "Expected a JSON body." }, { status: 400 });
+  }
+  // Only `v1/messages` generates output; `count_tokens` takes no `max_tokens`.
+  if (
+    endpoint === "v1/messages" &&
+    !(
+      typeof body.max_tokens === "number" &&
+      Number.isInteger(body.max_tokens) &&
+      body.max_tokens > 0 &&
+      body.max_tokens <= MAX_OUTPUT_TOKENS
+    )
+  ) {
+    return Response.json(
+      {
+        error: `max_tokens must be an integer from 1 to ${MAX_OUTPUT_TOKENS}.`
+      },
+      { status: 400 }
+    );
+  }
+  const headers: Record<string, string> = {
+    "content-type": "application/json"
+  };
+  const version = req.headers.get("anthropic-version");
+  if (version) headers["anthropic-version"] = version;
+  const beta = req.headers.get("anthropic-beta");
+  if (beta) headers["anthropic-beta"] = beta;
+  return env.AI.gateway(env.GATEWAY_ID).run({
+    provider: "anthropic",
+    endpoint,
+    headers,
+    query: body
+  });
+}
+
+/**
+ * The container Durable Object. We subclass the SDK's `Sandbox` to intercept
+ * the container's calls to `api.anthropic.com` and route them through the AI
+ * Gateway binding — no credentials ever enter the container.
+ */
+export class Sandbox extends BaseSandbox<Env> {
+  constructor(ctx: ConstructorParameters<typeof BaseSandbox>[0], env: Env) {
+    super(ctx, env);
+    // Anthropic is HTTPS, so HTTPS interception is required; everything else
+    // (e.g. the github.com clone) still reaches the internet normally.
+    this.interceptHttps = true;
+    this.enableInternet = true;
+  }
+}
+
+// Register via the inherited static setter — NOT a `static` class field, which
+// would shadow the accessor and never populate the interception registry.
+Sandbox.outboundByHost = { "api.anthropic.com": anthropicViaGateway };
+
+/**
+ * A coding sub-agent. Thin `AIChatAgent` that delegates one task to the Claude
+ * Code CLI running inside its own container, then reports back the diff.
+ *
+ * It never gets a top-level binding — the orchestrator spawns it as a facet via
+ * `agentTool` / `runAgentTool`, so `this.name` is the run id and each task is
+ * isolated in its own container.
+ */
+export class ClaudeCodeAgent extends AIChatAgent<Env> {
+  // Claude owns its native session; persist its id so each turn can --resume it.
+  private sessionId: string | undefined;
+  // The outcome of the most recent turn, returned as the agent-tool output.
+  private lastResult: TurnResult | undefined;
+
+  async onStart() {
+    this.sessionId = await this.ctx.storage.get<string>("claudeSessionId");
+    this.lastResult = await this.ctx.storage.get<TurnResult>("lastResult");
+  }
+
+  private sandbox(): Sandbox {
+    // One container per sub-agent. The orchestrator destroys it when the run
+    // reaches a terminal state; `sleepAfter` only bounds an idle drill-in.
+    const orchestrator = this.parentPath[this.parentPath.length - 1];
+    return sandboxFor(this.env, orchestrator?.name ?? "", this.name);
+  }
+
+  private setLastResult(result: TurnResult): void {
+    this.lastResult = result;
+    void this.ctx.storage.put("lastResult", result);
+  }
+
+  /**
+   * Clone the demo repo on first use. Idempotent — cheap once it exists.
+   *
+   * NOTE: the container disk is ephemeral. After `sleepAfter` the container
+   * cold-starts a clean filesystem, so this re-clones a pristine tree and any
+   * prior uncommitted edits (and Claude's `~/.claude` session) are lost. For
+   * true cross-sleep persistence, back the workspace + `~/.claude` up with
+   * `sandbox.createBackup({ directory })`, store the `DirectoryBackup` handle in
+   * DO storage, and restore here instead of cloning. See the README's
+   * "Durability & recovery" section. Deferred to keep this example zero-config.
+   */
+  private async ensureWorkspace(sandbox: Sandbox): Promise<void> {
+    const clone = await sandbox.exec(
+      `[ -d ${WORK_DIR}/.git ] || git clone --depth 1 ${REPO_URL} ${WORK_DIR}`
+    );
+    if (!clone.success) {
+      throw new Error(
+        `Could not clone ${REPO_URL} (exit ${clone.exitCode}): ` +
+          (clone.stderr.trim() || "no stderr")
+      );
+    }
+  }
+
+  async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
+    const sandbox = this.sandbox();
+    this.lastResult = undefined;
+    await this.ctx.storage.delete("lastResult");
+    try {
+      await this.ensureWorkspace(sandbox);
+      return await this.startClaudeCode(sandbox, options);
+    } catch (error) {
+      // Setup failed before the stream existed (clone, process start, dead
+      // container); the stream reports its own failures through `onResult`.
+      const message = error instanceof Error ? error.message : String(error);
+      this.setLastResult({ files: [], diff: "", error: message });
+      throw error;
+    }
+  }
+
+  private startClaudeCode(sandbox: Sandbox, options?: OnChatMessageOptions) {
+    return runClaudeCode({
+      sandbox,
+      workDir: WORK_DIR,
+      prompt: latestUserText(this.messages),
+      abortSignal: options?.abortSignal,
+      loadSessionId: () => this.sessionId,
+      saveSessionId: (id) => {
+        this.sessionId = id;
+        void this.ctx.storage.put("claudeSessionId", id);
+      },
+      // Forwarded to the orchestrator UI while running as an agent tool.
+      reportProgress: (p) => void this.reportProgress(p),
+      onResult: (result) => this.setLastResult(result)
+    });
+  }
+
+  /**
+   * What the orchestrator sees when this sub-agent finishes. Keep it compact —
+   * the full diff is huge and would bloat the orchestrator's context. The
+   * streamed message (including the rendered diff) is what the human sees.
+   */
+  protected getAgentToolOutput(): unknown {
+    const result = this.lastResult;
+    if (result?.error) {
+      return {
+        error: result.error,
+        filesChanged: result.files.map((f) => `${f.status || "M"} ${f.path}`)
+      };
+    }
+    if (!result || result.files.length === 0) {
+      return "Completed with no file changes.";
+    }
+    return {
+      filesChanged: result.files.map((f) => `${f.status || "M"} ${f.path}`),
+      diffLineCount: result.diff.split("\n").length
+    };
+  }
+
+  /**
+   * The outcome captured at the end of the latest turn (drill-in / debugging).
+   * Read from storage rather than the container, which is destroyed once the
+   * run finishes.
+   */
+  @callable()
+  async getLastResult(): Promise<TurnResult | null> {
+    return this.lastResult ?? null;
+  }
+}
+
+/**
+ * The orchestrator the user chats with. A Think agent that owns the planning
+ * loop and delegates the actual coding to `ClaudeCodeAgent` sub-agents.
+ */
+export class CodingOrchestrator extends Think<Env> {
+  // Cap how many containers run at once (also bounded by container max_instances).
+  override maxConcurrentAgentTools = 3;
+
+  override getModel() {
+    return "@cf/moonshotai/kimi-k2.7-code";
+  }
+
+  override getSystemPrompt(): string {
+    return [
+      "You are a coding orchestrator. You do NOT edit code yourself.",
+      "Instead you delegate concrete, self-contained coding tasks to Claude Code",
+      "agents — each runs in its own sandboxed container with the `aywson` repo",
+      "(a tiny JSONC parser) checked out.",
+      "Use `delegate_coding_task` for a single task.",
+      "Use `delegate_parallel` to run several independent tasks at once, or to",
+      "race competing attempts at the same task, then compare the diffs.",
+      "Split large requests into independent tasks where it helps.",
+      "Keep your own messages short: the delegated agents do the real work and",
+      "their progress streams to the user live. After they finish, summarize",
+      "what changed across them. If a delegate reports an error, say so honestly",
+      "instead of pretending it succeeded."
+    ].join(" ");
+  }
+
+  // Think ships built-in workspace tools (read/list/find/edit/…) bound to the
+  // orchestrator's OWN (empty) filesystem. This orchestrator has no local repo
+  // — it only delegates — so restrict the model to just the delegation tools.
+  override beforeTurn(): TurnConfig {
+    return { activeTools: ["delegate_coding_task", "delegate_parallel"] };
+  }
+
+  override getTools(): ToolSet {
+    return {
+      delegate_coding_task: agentTool<DelegateInput>(ClaudeCodeAgent, {
+        description:
+          "Delegate ONE self-contained coding task to a Claude Code agent " +
+          "running in its own container. Streams the agent's work back and " +
+          "returns the files it changed.",
+        displayName: "Claude Code",
+        inputSchema: z.object({
+          task: z
+            .string()
+            .min(5)
+            .describe(
+              "A clear, self-contained coding task to perform in the repo."
+            )
+        })
+      }),
+      delegate_parallel: tool({
+        description:
+          "Delegate MULTIPLE coding tasks at once — each to its own Claude Code " +
+          "container — and get every diff back to compare. Use for independent " +
+          "tasks, or competing attempts at the same task.",
+        inputSchema: z.object({
+          tasks: z
+            .array(z.string().min(5))
+            .min(2)
+            .max(3)
+            .describe(
+              "Independent coding tasks (or repeated attempts) to run in parallel."
+            )
+        }),
+        execute: async ({ tasks }, { toolCallId, abortSignal }) => {
+          const outcomes = await Promise.allSettled(
+            tasks.map((task, i) =>
+              this.runAgentTool<DelegateInput>(ClaudeCodeAgent, {
+                input: { task },
+                parentToolCallId: toolCallId,
+                displayOrder: i,
+                display: { name: "Claude Code" },
+                signal: abortSignal
+              })
+            )
+          );
+          return outcomes.map((outcome, i) => {
+            const task = tasks[i];
+            if (outcome.status === "rejected") {
+              return {
+                task,
+                error:
+                  outcome.reason instanceof Error
+                    ? outcome.reason.message
+                    : String(outcome.reason)
+              };
+            }
+            const run = outcome.value;
+            return run.status === "completed"
+              ? { task, runId: run.runId, result: run.output ?? run.summary }
+              : { task, runId: run.runId, error: run.error ?? run.status };
+          });
+        }
+      })
+    };
+  }
+
+  /** Gate HTTP/WS drill-in into a sub-agent facet to runs this orchestrator owns. */
+  override async onBeforeSubAgent(
+    _request: Request,
+    child: { className: string; name: string }
+  ): Promise<Response | void> {
+    if (child.className !== "ClaudeCodeAgent") {
+      return new Response(`Unknown agent tool class: ${child.className}`, {
+        status: 404
+      });
+    }
+    if (!this.hasAgentToolRun(child.className, child.name)) {
+      return new Response(
+        `Agent tool ${child.className}/${child.name} not found`,
+        { status: 404 }
+      );
+    }
+  }
+
+  // Containers are billed while awake and count against `max_instances`, so
+  // track every run's sandbox and tear it down as soon as the run is over.
+  override async onAgentToolStart(run: AgentToolRunInfo): Promise<void> {
+    await this.ctx.storage.put(`${SANDBOX_RUN_PREFIX}${run.runId}`, true);
+  }
+
+  override async onAgentToolFinish(
+    run: AgentToolRunInfo,
+    result: AgentToolLifecycleResult
+  ): Promise<void> {
+    // `interrupted` means the orchestrator stopped waiting, not that the child
+    // stopped working (`childStillRunning` is unset when that is unknown). Keep
+    // its container; `releaseIdleSandboxes` frees it once the child settles.
+    if (result.status === "interrupted" && result.childStillRunning !== false) {
+      return;
+    }
+    // An `error` can also be the parent losing the child's stream while the
+    // child keeps editing; keep a live child's container for the sweep too.
+    if (result.status === "error" && (await this.isChildLive(run.runId))) {
+      return;
+    }
+    await this.destroySandbox(run.runId);
+  }
+
+  /** Whether the child still reports its run as in flight (or can't be asked). */
+  private async isChildLive(runId: string): Promise<boolean> {
+    if (!this.hasAgentToolRun(ClaudeCodeAgent, runId)) return false;
+    try {
+      const child = await this.dynamicAgents.get(ClaudeCodeAgent, runId);
+      const inspection = await child.inspectAgentToolRun(runId);
+      return (
+        inspection?.status === "running" || inspection?.status === "starting"
+      );
+    } catch (error) {
+      console.warn(`Could not inspect run ${runId}; keeping it:`, error);
+      return true;
+    }
+  }
+
+  // Some runs never deliver a usable finish: a child that failed to start, or
+  // one kept alive above. Sweep them on every wake.
+  override async onStart(): Promise<void> {
+    this.ctx.waitUntil(this.releaseIdleSandboxes());
+  }
+
+  private async releaseIdleSandboxes(): Promise<void> {
+    const tracked = await this.ctx.storage.list({ prefix: SANDBOX_RUN_PREFIX });
+    for (const key of tracked.keys()) {
+      const runId = key.slice(SANDBOX_RUN_PREFIX.length);
+      if (await this.isChildLive(runId)) continue;
+      await this.destroySandbox(runId);
+    }
+  }
+
+  @callable()
+  async clearDelegatedRuns(): Promise<void> {
+    await this.clearAgentToolRuns();
+    const tracked = await this.ctx.storage.list({ prefix: SANDBOX_RUN_PREFIX });
+    await Promise.all(
+      [...tracked.keys()].map((key) =>
+        this.destroySandbox(key.slice(SANDBOX_RUN_PREFIX.length))
+      )
+    );
+  }
+
+  private async destroySandbox(runId: string): Promise<void> {
+    try {
+      await sandboxFor(this.env, this.name, runId).destroy();
+    } catch (error) {
+      console.warn(`Failed to destroy sandbox for run ${runId}:`, error);
+      return;
+    }
+    await this.ctx.storage.delete(`${SANDBOX_RUN_PREFIX}${runId}`);
+  }
+}
+
+const SANDBOX_RUN_PREFIX = "sandbox-run:";
+
+/** What one Claude Code turn produced; `error` is set when the turn failed. */
+type TurnResult = WorkspaceDiff & { error?: string };
+
+/**
+ * The sandbox for one delegated run. Its id is derived from the orchestrator
+ * name AND the run id, so two orchestrators never share a container.
+ */
+function sandboxFor(env: Env, orchestratorName: string, runId: string) {
+  return getSandbox(
+    env.Sandbox,
+    sandboxIdFor(`${orchestratorName}\0${runId}`),
+    {
+      sleepAfter: "15m"
+    }
+  );
+}
+
+/**
+ * A stable, DNS-safe sandbox id (≤63 chars, lowercase) derived from a key.
+ * Same key → same id → same container across turns. The run id alone can
+ * exceed the 63-char limit a sandbox id requires, hence the hash.
+ */
+function sandboxIdFor(name: string): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0xc2b2ae35;
+  for (let i = 0; i < name.length; i++) {
+    const c = name.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193);
+    h2 = Math.imul(h2 ^ c, 0x85ebca6b);
+  }
+  const hash = ((h1 >>> 0).toString(36) + (h2 >>> 0).toString(36)).slice(0, 16);
+  return `task-${hash}`;
+}
+
+function latestUserText(messages: UIMessage[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") {
+      return messages[i].parts
+        .filter((p) => p.type === "text")
+        .map((p) => (p as { text: string }).text)
+        .join("");
+    }
+  }
+  return "";
+}
+
+export default {
+  async fetch(request: Request, env: Env) {
+    return (
+      (await routeAgentRequest(request, env)) ||
+      new Response("Not found", { status: 404 })
+    );
+  }
+} satisfies ExportedHandler<Env>;

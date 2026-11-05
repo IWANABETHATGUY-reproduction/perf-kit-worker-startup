@@ -1,0 +1,15 @@
+{
+    "extends": "@total-typescript/tsconfig/bundler/dom/app",
+    "references": [
+        { "path": "./tsconfig.node.json" },
+        { "path": "./tsconfig.cloudflare.json" }
+    ],
+    "compilerOptions": {
+        "checkJs": true,
+        "verbatimModuleSyntax": true,
+        "skipLibCheck": true,
+        "strict": true,
+        "noEmit": false,
+        "types": ["@cloudflare/workers-types/2023-07-01"]
+    }
+}

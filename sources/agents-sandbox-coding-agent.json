@@ -1,0 +1,36 @@
+{
+  "upstream": "https://github.com/cloudflare/agents.git",
+  "commit": "361046e4f5f528540783d9078c438cb3cbe2d470",
+  "path": "examples/sandbox-coding-agent",
+  "license": "MIT",
+  "worker": ".",
+  "notes": [
+    "apps/agents-sandbox-coding-agent is the upstream folder at this commit, with the changes below. The source files are unchanged.",
+    "LICENSE is the license file of the upstream repository root. The example folder has none of its own.",
+    "In the upstream monorepo the workspace installs the dependencies. The copy installs on its own with bun, so it gets its own bun.lock.",
+    "just-bash is added: agents and @cloudflare/computer list it as an optional peer, and the app reaches agents/dist/skills/runner.js, which imports it. Without it the build fails with: [MISSING_EXPORT] \"Bash\" is not exported by \"__vite-optional-peer-dep:just-bash:agents\".",
+    "pnpm-lock.yaml and pnpm-workspace.yaml come from an earlier install with pnpm. The harness does not use them."
+  ],
+  "packageJson": {
+    "package.json": {
+      "set": {
+        "dependencies": {
+          "@ai-sdk/react": "latest",
+          "just-bash": "^3.6.0"
+        },
+        "devDependencies": {
+          "@cloudflare/vite-plugin": "1.66.0",
+          "@vitejs/plugin-react": "^6.0.0",
+          "wrangler": "4.156.0"
+        },
+        "overrides": {
+          "vite": "8.3.5",
+          "rolldown": "1.2.16"
+        }
+      },
+      "replace": {
+        "workspaces": ["."]
+      }
+    }
+  }
+}

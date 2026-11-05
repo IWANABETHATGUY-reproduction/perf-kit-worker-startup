@@ -1,0 +1,298 @@
+diff --git a/vite.config.ts b/vite.config.ts
+index c671c28..690df78 100644
+--- a/vite.config.ts
++++ b/vite.config.ts
+@@ -1,13 +1,75 @@
+ import { cloudflare } from "@cloudflare/vite-plugin"
+ import { reactRouter } from "@react-router/dev/vite"
+ import tailwindcss from "@tailwindcss/vite"
+-import { defineConfig } from "vite"
++import { fileURLToPath } from "node:url"
++import { defineConfig, type Plugin } from "vite"
+ import tsconfigPaths from "vite-tsconfig-paths"
+ 
+-export default defineConfig({
++// `react-dom/server` (the edge entry) eagerly requires both the streaming
++// renderer and the legacy `renderToString` renderer. This app only uses
++// `renderToReadableStream`, so point the server build at the streaming
++// renderer directly and leave the legacy one out of the Worker bundle.
++const reactDomServerStreaming = fileURLToPath(
++    new URL(
++        "./node_modules/react-dom/cjs/react-dom-server.edge.production.js",
++        import.meta.url,
++    ),
++)
++
++/**
++ * `@standard-community/standard-json` dynamically imports a JSON-Schema
++ * adapter for every schema vendor it supports (zod, effect, valibot and
++ * arktype). This app supplies the JSON Schema for its MCP tools directly and
++ * validates with Zod v4, so none of those adapters can ever be selected at
++ * runtime. Stubbing them keeps hundreds of kilobytes of unreachable code out
++ * of the Worker bundle (which workerd compiles at isolate startup).
++ */
++function stubUnusedStandardJsonAdapters(): Plugin {
++    const stubPrefix = "\0stub-standard-json-adapter:"
++    const standardJsonIndex =
++        /[\\/]@standard-community[\\/]standard-json[\\/]dist[\\/]index\.js$/
++    const adapterImport = /^\.\/(?:zod|effect|valibot|arktype)-[^/]+\.js$/
++
++    return {
++        name: "stub-unused-standard-json-adapters",
++        enforce: "pre",
++        resolveId(source, importer) {
++            if (
++                importer &&
++                standardJsonIndex.test(importer) &&
++                adapterImport.test(source)
++            ) {
++                return stubPrefix + source
++            }
++        },
++        load(id) {
++            if (id.startsWith(stubPrefix)) {
++                return "export function toJsonSchema() { throw new Error('Unsupported schema vendor') }\n"
++            }
++        },
++    }
++}
++
++export default defineConfig(({ command }) => ({
+     server: {
+         port: 5174,
+     },
++    build: {
++        // workerd parses every module in the bundle when an isolate starts,
++        // so smaller output also means a shorter cold start.
++        minify: "oxc",
++    },
++    resolve: {
++        alias:
++            command === "build"
++                ? [
++                      {
++                          find: /^react-dom\/server$/,
++                          replacement: reactDomServerStreaming,
++                      },
++                  ]
++                : [],
++    },
+     plugins: [
+         cloudflare({
+             viteEnvironment: { name: "ssr" },
+@@ -15,6 +77,7 @@ export default defineConfig({
+         tailwindcss(),
+         reactRouter(),
+         tsconfigPaths(),
++        stubUnusedStandardJsonAdapters(),
+     ],
+     optimizeDeps: {
+         exclude: [
+@@ -26,4 +89,4 @@ export default defineConfig({
+     ssr: {
+         noExternal: true,
+     },
+-})
++}))
+diff --git a/workers/app.ts b/workers/app.ts
+index 279f6b7..118db78 100644
+--- a/workers/app.ts
++++ b/workers/app.ts
+@@ -1,20 +1,6 @@
+ import { DurableObject } from "cloudflare:workers"
+-import { Supermemory } from "supermemory"
+-import { Hono } from "hono"
+-import { cors } from "hono/cors"
+-import {
+-    type PromptResponseType,
+-    type Resource,
+-    type ToolResponseType,
+-    bridge,
+-    describePrompt,
+-    describeTool,
+-    mValidator,
+-    muppet,
+-} from "muppet"
+-import { SSEHonoTransport, streamSSE } from "muppet/streaming"
+-import { createRequestHandler } from "react-router"
+-import { z } from "zod"
++import type { PromptResponseType, ToolResponseType } from "muppet"
++import type { SSEHonoTransport } from "muppet/streaming"
+ 
+ declare module "react-router" {
+     export interface AppLoadContext {
+@@ -25,19 +11,46 @@ declare module "react-router" {
+     }
+ }
+ 
+-const requestHandler = createRequestHandler(
+-    // @ts-ignore
+-    () => import("virtual:react-router/server-build"),
+-    import.meta.env.MODE,
+-)
++// Heavy, request-only dependencies are imported lazily so that loading a new
++// isolate only has to evaluate this module and nothing else.
++let requestHandlerPromise:
++    | Promise<ReturnType<typeof import("react-router").createRequestHandler>>
++    | undefined
++
++function getRequestHandler() {
++    if (!requestHandlerPromise) {
++        requestHandlerPromise = import("react-router").then(
++            ({ createRequestHandler }) =>
++                createRequestHandler(
++                    // @ts-ignore
++                    () => import("virtual:react-router/server-build"),
++                    import.meta.env.MODE,
++                ),
++        )
++    }
++    return requestHandlerPromise
++}
+ 
+ type AppType = {
+     Bindings: Env
+ }
+-const app = new Hono<AppType>()
+-
+-function createSuperMemory(userId: string, env: Env) {
+ 
++async function createSuperMemory(userId: string, env: Env) {
++    const [
++        { Supermemory },
++        { Hono },
++        { cors },
++        { describePrompt, describeTool, muppet },
++        { addMemoryValidator, searchMemoriesValidator },
++    ] = await Promise.all([
++        import("supermemory"),
++        import("hono"),
++        import("hono/cors"),
++        import("muppet"),
++        import("./mcp-validators"),
++    ])
++
++    const app = new Hono<AppType>()
+     const supermemory = new Supermemory({
+         apiKey: env.SUPERMEMORY_API_KEY,
+     })
+@@ -73,12 +86,7 @@ function createSuperMemory(userId: string, env: Env) {
+             description:
+                 "Store user information, preferences, and behaviors. Run on explicit commands ('remember this') or implicitly when detecting significant user traits, preferences, or patterns. Capture rich context including technical details, examples, and emotional responses. You should think about running this after every user message. YOU MUST USE THE TOOLS/CALL TO USE THIS. NOTHING ELSE. THIS IS NOT A RESOURCE. IT'S A TOOL.",
+         }),
+-        mValidator(
+-            "json",
+-            z.object({
+-                thingToRemember: z.string(),
+-            }),
+-        ),
++        addMemoryValidator,
+         async (c) => {
+             const { thingToRemember } = c.req.valid("json")
+ 
+@@ -127,12 +135,7 @@ function createSuperMemory(userId: string, env: Env) {
+             description:
+                 "Search user memories and patterns. Run when explicitly asked or when context about user's past choices would be helpful. Uses semantic matching to find relevant details across related experiences. If you do not have prior knowledge about something, this is the perfect tool to call. YOU MUST USE THE TOOLS/CALL TO USE THIS. THIS IS NOT A RESOURCE. IT'S A TOOL.",
+         }),
+-        mValidator(
+-            "json",
+-            z.object({
+-                informationToGet: z.string(),
+-            }),
+-        ),
++        searchMemoriesValidator,
+         async (c) => {
+             const { informationToGet } = c.req.valid("json")
+ 
+@@ -163,6 +166,18 @@ export class MyDurableObject extends DurableObject<Env> {
+         const url = new URL(request.url)
+         const userId = url.pathname.split("/")[1] // Get userId from path
+ 
++        const [
++            { Hono },
++            { cors },
++            { SSEHonoTransport, streamSSE },
++            { bridge, muppet },
++        ] = await Promise.all([
++            import("hono"),
++            import("hono/cors"),
++            import("muppet/streaming"),
++            import("muppet"),
++        ])
++
+         // Initialize transport if not exists
+         if (!this.transport) {
+             this.transport = new SSEHonoTransport(
+@@ -197,7 +212,7 @@ export class MyDurableObject extends DurableObject<Env> {
+                 this.transport?.connectWithStream(stream)
+ 
+                 await bridge({
+-                    mcp: muppet(createSuperMemory(userId, c.env), {
++                    mcp: muppet(await createSuperMemory(userId, c.env), {
+                         name: "Supermemory MCP",
+                         version: "1.0.0",
+                     }),
+@@ -254,6 +269,8 @@ export default {
+             return stub.fetch(request)
+         }
+ 
++        const requestHandler = await getRequestHandler()
++
+         return requestHandler(request, {
+             cloudflare: { env, ctx },
+         })
+diff --git a/workers/mcp-validators.ts b/workers/mcp-validators.ts
+new file mode 100644
+index 0000000..b9a2e61
+--- /dev/null
++++ b/workers/mcp-validators.ts
+@@ -0,0 +1,49 @@
++import { sValidator } from "@hono/standard-validator"
++import { uniqueSymbol } from "muppet"
++import { z } from "zod/v4"
++
++type JsonSchema = Record<string, unknown>
++
++/**
++ * Same contract as muppet's `mValidator`, but with the JSON Schema supplied
++ * directly. muppet would otherwise need the per-vendor schema-to-JSON-Schema
++ * adapters from `@standard-community/standard-json`, even though this app only
++ * uses Zod.
++ */
++function withJsonSchema<T extends z.ZodType>(
++    schema: T,
++    jsonSchema: JsonSchema,
++) {
++    return Object.assign(sValidator("json", schema), {
++        [uniqueSymbol]: {
++            validationTarget: "json" as const,
++            toJson: { schema: jsonSchema },
++        },
++    })
++}
++
++export const addMemoryValidator = withJsonSchema(
++    z.object({
++        thingToRemember: z.string(),
++    }),
++    {
++        type: "object",
++        properties: { thingToRemember: { type: "string" } },
++        required: ["thingToRemember"],
++        additionalProperties: false,
++        $schema: "http://json-schema.org/draft-07/schema#",
++    },
++)
++
++export const searchMemoriesValidator = withJsonSchema(
++    z.object({
++        informationToGet: z.string(),
++    }),
++    {
++        type: "object",
++        properties: { informationToGet: { type: "string" } },
++        required: ["informationToGet"],
++        additionalProperties: false,
++        $schema: "http://json-schema.org/draft-07/schema#",
++    },
++)

@@ -1,0 +1,46 @@
+{
+  "name": "@cloudflare/agents-sandbox-coding-agent-example",
+  "description": "A Think agent that orchestrates Claude Code coding agents, each running in its own Cloudflare Sandbox container, with live progress and diffs streamed into the chat",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "scripts": {
+    "start": "vite dev",
+    "deploy": "vite build && wrangler deploy",
+    "types": "wrangler types env.d.ts --include-runtime false"
+  },
+  "dependencies": {
+    "@ai-sdk/react": "latest",
+    "@cloudflare/ai-chat": "*",
+    "@cloudflare/computer": "^0.8.0",
+    "@cloudflare/kumo": "^2.6.0",
+    "@cloudflare/sandbox": "0.12.14",
+    "@cloudflare/think": "*",
+    "@phosphor-icons/react": "^2.1.10",
+    "@streamdown/code": "^1.1.1",
+    "agents": "*",
+    "ai": "^7.0.0",
+    "just-bash": "^3.6.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "streamdown": "^2.5.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "1.66.0",
+    "@cloudflare/workers-types": "^5.20261014.1",
+    "@tailwindcss/vite": "^4",
+    "@types/node": "^26.0.1",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.0",
+    "tailwindcss": "^4.3.2",
+    "typescript": "^6.0.3",
+    "wrangler": "4.156.0"
+  },
+  "workspaces": ["."],
+  "overrides": {
+    "vite": "8.3.5",
+    "rolldown": "1.2.16"
+  }
+}

@@ -1,0 +1,261 @@
+diff --git a/src/mcp-client-shim.ts b/src/mcp-client-shim.ts
+new file mode 100644
+index 0000000..36c3680
+--- /dev/null
++++ b/src/mcp-client-shim.ts
+@@ -0,0 +1,136 @@
++/**
++ * The MCP client is only needed when an agent actually connects to an MCP
++ * server. Keep its implementation out of the Worker's global scope: these
++ * lazy constructors load the real package (and construct the real object) on
++ * first use.
++ */
++type RealModule = typeof import("@modelcontextprotocol/client");
++type Lazy = { __lazyResolve(): Promise<unknown> };
++
++let realModule: Promise<RealModule> | undefined;
++
++function loadReal(): Promise<RealModule> {
++  realModule ??= import("@mcp-real-client");
++  return realModule;
++}
++
++function isLazy(value: unknown): value is Lazy {
++  return (
++    typeof value === "object" &&
++    value !== null &&
++    typeof (value as Lazy).__lazyResolve === "function"
++  );
++}
++
++async function unwrap(value: unknown): Promise<unknown> {
++  return isLazy(value) ? await value.__lazyResolve() : value;
++}
++
++async function unwrapArgs(args: unknown[]): Promise<unknown[]> {
++  return Promise.all(args.map(unwrap));
++}
++
++function lazyClass<K extends "Client" | "SSEClientTransport" | "StreamableHTTPClientTransport">(
++  exportName: K
++) {
++  return class LazyExport {
++    private args: unknown[];
++    private real: InstanceType<RealModule[K]> | undefined;
++    private loading: Promise<InstanceType<RealModule[K]>> | undefined;
++
++    constructor(...args: unknown[]) {
++      this.args = args;
++      return new Proxy(this, {
++        get(target, prop, receiver) {
++          if (prop === "__lazyResolve") return () => resolve(target);
++          if (prop in target) return Reflect.get(target, prop, receiver);
++          const real = target.real;
++          if (real) {
++            const value = real[prop as keyof typeof real];
++            return typeof value === "function" ? value.bind(real) : value;
++          }
++          return async (...callArgs: unknown[]) => {
++            const instance = await resolve(target);
++            const value = instance[prop as keyof typeof instance];
++            if (typeof value !== "function") return value;
++            return (value as (...args: unknown[]) => unknown).apply(
++              instance,
++              await unwrapArgs(callArgs)
++            );
++          };
++        },
++        set(target, prop, value) {
++          if (target.real) {
++            (target.real as unknown as Record<PropertyKey, unknown>)[prop] = value;
++          } else {
++            (target as Record<PropertyKey, unknown>)[prop] = value;
++          }
++          return true;
++        }
++      });
++    }
++
++    private async resolve(): Promise<InstanceType<RealModule[K]>> {
++      return resolve(this);
++    }
++
++    private async resolveInstance(): Promise<InstanceType<RealModule[K]>> {
++      return resolve(this);
++    }
++  };
++
++  async function resolve(
++    target: InstanceType<ReturnType<typeof lazyClass>>
++  ): Promise<InstanceType<RealModule[K]>> {
++    const lazy = target as unknown as {
++      args: unknown[];
++      real?: InstanceType<RealModule[K]>;
++      loading?: Promise<InstanceType<RealModule[K]>>;
++    };
++    if (lazy.real) return lazy.real;
++    lazy.loading ??= (async () => {
++      const module = await loadReal();
++      const Constructor = module[exportName] as new (
++        ...args: unknown[]
++      ) => InstanceType<RealModule[K]>;
++      lazy.real = new Constructor(...(await unwrapArgs(lazy.args)));
++      return lazy.real;
++    })();
++    return lazy.loading;
++  }
++}
++
++export const Client = lazyClass("Client");
++export const SSEClientTransport = lazyClass("SSEClientTransport");
++export const StreamableHTTPClientTransport = lazyClass(
++  "StreamableHTTPClientTransport"
++);
++
++/** Error type check used by the MCP transport fallback. */
++export class SdkHttpError extends Error {
++  status?: number;
++
++  static [Symbol.hasInstance](value: unknown): boolean {
++    return (
++      value instanceof Error &&
++      (value.name === "SdkHttpError" ||
++        typeof (value as { status?: unknown }).status === "number")
++    );
++  }
++}
++
++/** SEP-991 URL-based client IDs are optional; preserve the same validation. */
++export function validateClientMetadataUrl(url?: string): void {
++  if (!url) return;
++  let parsed: URL;
++  try {
++    parsed = new URL(url);
++  } catch {
++    parsed = undefined as unknown as URL;
++  }
++  if (!parsed || parsed.protocol !== "https:" || parsed.pathname === "/") {
++    throw new Error(
++      `clientMetadataUrl must be a valid HTTPS URL with a non-root pathname, got: ${url}`
++    );
++  }
++}
+diff --git a/src/mcp-real-client.d.ts b/src/mcp-real-client.d.ts
+new file mode 100644
+index 0000000..7ce137d
+--- /dev/null
++++ b/src/mcp-real-client.d.ts
+@@ -0,0 +1,3 @@
++declare module "@mcp-real-client" {
++  export * from "@modelcontextprotocol/client";
++}
+diff --git a/src/server.ts b/src/server.ts
+index 615da45..f55eca7 100644
+--- a/src/server.ts
++++ b/src/server.ts
+@@ -16,14 +16,20 @@
+ 
+ import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
+ import { getSandbox, Sandbox as BaseSandbox } from "@cloudflare/sandbox";
+-import { Think, type TurnConfig } from "@cloudflare/think";
+ import { callable, routeAgentRequest } from "agents";
+ import {
+   agentTool,
+   type AgentToolLifecycleResult,
+   type AgentToolRunInfo
+ } from "agents/agent-tools";
+-import { tool, type ToolSet, type UIMessage } from "ai";
++import {
++  convertToModelMessages,
++  stepCountIs,
++  streamText,
++  tool,
++  type ToolSet,
++  type UIMessage
++} from "ai";
+ import { z } from "zod";
+ import { MAX_OUTPUT_TOKENS, runClaudeCode } from "./claude-code";
+ import type { WorkspaceDiff } from "./diff";
+@@ -241,18 +247,18 @@ export class ClaudeCodeAgent extends AIChatAgent<Env> {
+ }
+ 
+ /**
+- * The orchestrator the user chats with. A Think agent that owns the planning
++ * The orchestrator the user chats with. A chat agent that owns the planning
+  * loop and delegates the actual coding to `ClaudeCodeAgent` sub-agents.
+  */
+-export class CodingOrchestrator extends Think<Env> {
++export class CodingOrchestrator extends AIChatAgent<Env> {
+   // Cap how many containers run at once (also bounded by container max_instances).
+   override maxConcurrentAgentTools = 3;
+ 
+-  override getModel() {
++  getModel() {
+     return "@cf/moonshotai/kimi-k2.7-code";
+   }
+ 
+-  override getSystemPrompt(): string {
++  getSystemPrompt(): string {
+     return [
+       "You are a coding orchestrator. You do NOT edit code yourself.",
+       "Instead you delegate concrete, self-contained coding tasks to Claude Code",
+@@ -269,14 +275,25 @@ export class CodingOrchestrator extends Think<Env> {
+     ].join(" ");
+   }
+ 
+-  // Think ships built-in workspace tools (read/list/find/edit/…) bound to the
+-  // orchestrator's OWN (empty) filesystem. This orchestrator has no local repo
+-  // — it only delegates — so restrict the model to just the delegation tools.
+-  override beforeTurn(): TurnConfig {
+-    return { activeTools: ["delegate_coding_task", "delegate_parallel"] };
++  // The orchestrator only delegates. Unlike a full Think turn (which also
++  // assembles workspace/skill tools), this loop is given exactly the two
++  // delegation tools, so the planner cannot wander into a local repo.
++  async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
++    // Resolve the model lazily: loading the Workers AI provider at module scope
++    // is a large chunk of the Worker's startup CPU.
++    const { createWorkersAI } = await import("workers-ai-provider");
++    const result = streamText({
++      model: createWorkersAI({ binding: this.env.AI })(this.getModel()),
++      system: this.getSystemPrompt(),
++      messages: await convertToModelMessages(this.messages),
++      tools: this.getTools(),
++      stopWhen: stepCountIs(10),
++      abortSignal: options?.abortSignal
++    });
++    return result.toUIMessageStreamResponse({ sendReasoning: true });
+   }
+ 
+-  override getTools(): ToolSet {
++  getTools(): ToolSet {
+     return {
+       delegate_coding_task: agentTool<DelegateInput>(ClaudeCodeAgent, {
+         description:
+diff --git a/vite.config.ts b/vite.config.ts
+index fcf4ff0..b779171 100644
+--- a/vite.config.ts
++++ b/vite.config.ts
+@@ -2,8 +2,23 @@ import { cloudflare } from "@cloudflare/vite-plugin";
+ import tailwindcss from "@tailwindcss/vite";
+ import react from "@vitejs/plugin-react";
+ import agents from "agents/vite";
++import { fileURLToPath } from "node:url";
+ import { defineConfig } from "vite";
+ 
++const mcpClientReal = fileURLToPath(
++  new URL("./node_modules/@modelcontextprotocol/client/dist/index.mjs", import.meta.url)
++);
++
+ export default defineConfig({
++  build: { minify: true },
++  resolve: {
++    alias: [
++      {
++        find: /^@modelcontextprotocol\/client$/,
++        replacement: "/src/mcp-client-shim.ts"
++      },
++      { find: "@mcp-real-client", replacement: mcpClientReal }
++    ]
++  },
+   plugins: [agents(), react(), cloudflare(), tailwindcss()]
+ });

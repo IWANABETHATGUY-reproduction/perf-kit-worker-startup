@@ -1,0 +1,1362 @@
+diff --git a/src/server.ts b/src/server.ts
+index 8eedd84..aae656d 100644
+--- a/src/server.ts
++++ b/src/server.ts
+@@ -1,17 +1,4 @@
+-import {
+-  createStartHandler,
+-  defaultStreamHandler,
+-} from "@tanstack/react-start/server";
+ import { routeAgentRequest } from "agents";
+-import { everyApp } from "@every-app/sdk/server";
+-import { serveEveryAppRequest } from "@/server/lib/gateway-attribution";
+-import { resolveUserContextFromHeaders } from "@/middleware/ensure-user/resolve";
+-import { ProjectRepository } from "@/server/features/projects/repositories/ProjectRepository";
+-import { SamSessionRepository } from "@/server/features/sam/SamSessionRepository";
+-import { runScheduledRankChecks } from "@/server/features/rank-tracking/services/scheduledRankChecks";
+-import { reconcileStaleAudits } from "@/server/features/audit/services/auditReconciler";
+-import { sendFirstAuditEmails } from "@/server/features/audit/services/firstAuditEmails";
+-import { getOrCreateOrganizationCustomer } from "@/server/billing/subscription";
+ import { isHostedServerAuthMode } from "@/server/lib/runtime-env";
+ import {
+   getAuthMode,
+@@ -19,25 +6,50 @@ import {
+   setRuntimeAuthMode,
+   usesBetterAuth,
+ } from "@/lib/auth-mode";
+-import {
+-  createOpenSeoOAuthProvider,
+-  type OpenSeoOAuthEnv,
+-} from "@/server/mcp/oauth-provider";
++import type { OpenSeoOAuthEnv } from "@/server/mcp/oauth-provider";
+ import { requestWithPublicOrigin } from "@/server/mcp/public-origin";
+ import { MCP_ROUTE } from "@/server/mcp/context";
+-import { withPgClient } from "@/db";
+ import { withDataforseoSlots } from "@/server/lib/dataforseo/request-slots";
+-import {
+-  AUTUMN_WEBHOOK_PATH,
+-  handleAutumnWebhookRequest,
+-} from "@/server/billing/autumn-webhook";
+-import { sweepDubReferredOrganizations } from "@/server/referrals/dub";
+-import { maybeSendSelfHostHeartbeat } from "@/server/lib/self-host-telemetry";
+-import { handleOperatorRequest } from "@/server/standalone/admin";
+-import { handleImport, isLegacyImportActive } from "@/server/standalone/import";
++import { AUTUMN_WEBHOOK_PATH } from "@/server/billing/autumn-webhook-path";
+ import { hasOperatorSecret } from "@/server/standalone/operator-auth";
+ 
+-const startHandler = createStartHandler(defaultStreamHandler);
++// Startup CPU is a hard limit on Workers, and the isolate evaluates every
++// statically imported module before it can serve a request. Everything below
++// is therefore loaded on first use: the request handlers, cron jobs and the
++// OAuth provider pay a one-time dynamic import, and the isolate no longer
++// evaluates the database, auth, billing and workflow service graphs for a
++// request that never touches them.
++let dbModule: Promise<typeof import("@/db")> | undefined;
++function withPgClientLazy<T>(fn: () => Promise<T>): Promise<T> {
++  return (dbModule ??= import("@/db")).then(({ withPgClient }) =>
++    withPgClient(fn),
++  );
++}
++
++type OpenSeoOAuthProvider = ReturnType<
++  typeof import("@/server/mcp/oauth-provider").createOpenSeoOAuthProvider
++>;
++let oauthProvider: Promise<OpenSeoOAuthProvider> | undefined;
++function getOpenSeoOAuthProvider(): Promise<OpenSeoOAuthProvider> {
++  return (oauthProvider ??= import("@/server/mcp/oauth-provider").then(
++    ({ createOpenSeoOAuthProvider }) => createOpenSeoOAuthProvider(appFetch),
++  ));
++}
++
++// The TanStack Start handler brings the React SSR stack (react-dom/server,
++// h3, the router's server runtime) — around a megabyte of source that only an
++// HTML route needs. Load it on the first app document instead of at isolate
++// startup; API, MCP, agent and static-asset requests never touch it.
++type StartHandler = ReturnType<
++  typeof import("@tanstack/react-start/server").createStartHandler
++>;
++let startHandlerPromise: Promise<StartHandler> | undefined;
++function getStartHandler(): Promise<StartHandler> {
++  return (startHandlerPromise ??= import("@tanstack/react-start/server").then(
++    ({ createStartHandler, defaultStreamHandler }) =>
++      createStartHandler(defaultStreamHandler),
++  ));
++}
+ 
+ // The app ships no security response headers of its own, so any third-party
+ // page can frame an app route and UI-redress a one-click action (delete a
+@@ -53,6 +65,7 @@ const startHandler = createStartHandler(defaultStreamHandler);
+ // one call site covers the OAuth-provider path too, which serves app documents
+ // through this same function.
+ async function appFetch(request: Request): Promise<Response> {
++  const startHandler = await getStartHandler();
+   const response = await startHandler(request);
+   const contentType = response.headers.get("content-type") ?? "";
+   if (
+@@ -70,8 +83,6 @@ async function appFetch(request: Request): Promise<Response> {
+   });
+ }
+ 
+-const openSeoOAuthProvider = createOpenSeoOAuthProvider(appFetch);
+-
+ // Authorize a SAM agent connection in the Worker, before it reaches the Durable
+ // Object. The DO instance name is the sessionId (set client-side); we resolve
+ // the session here and authorize the caller against the session's project via
+@@ -82,6 +93,12 @@ async function authorizeSamChat(
+   request: Request,
+   sessionId: string,
+ ): Promise<Response | undefined> {
++  const [{ resolveUserContextFromHeaders }, { SamSessionRepository }, { ProjectRepository }] =
++    await Promise.all([
++      import("@/middleware/ensure-user/resolve"),
++      import("@/server/features/sam/SamSessionRepository"),
++      import("@/server/features/projects/repositories/ProjectRepository"),
++    ]);
+   let context;
+   try {
+     context = await resolveUserContextFromHeaders(request.headers);
+@@ -105,6 +122,9 @@ async function authorizeSamChat(
+   // before the DO's balance gate runs, or a brand-new org's first message hits
+   // a false "out of credits". Hosted-only; self-hosted has no Autumn.
+   if (await isHostedServerAuthMode()) {
++    const { getOrCreateOrganizationCustomer } = await import(
++      "@/server/billing/subscription"
++    );
+     await getOrCreateOrganizationCustomer(context);
+   }
+   return undefined;
+@@ -142,8 +162,8 @@ function fetch(
+   // Scope a per-request Postgres client (no-op in D1 mode). The client isn't
+   // closed here — the Workers↔Hyperdrive socket is reclaimed at invocation end.
+   // The DataForSEO cap is per request too, matching the connection limit.
+-  return withPgClient(() =>
+-    withDataforseoSlots(() => Promise.resolve(handleFetch(request, env, ctx))),
++  return withDataforseoSlots(() =>
++    withPgClientLazy(() => Promise.resolve(handleFetch(request, env, ctx))),
+   );
+ }
+ 
+@@ -162,6 +182,10 @@ async function handleEveryAppRequest(
+     const { everyAppTools } = await import("@/server/everyapp/tools");
+     return everyAppTools.fetch(request, env, ctx);
+   }
++  const [{ everyApp }, { serveEveryAppRequest }] = await Promise.all([
++    import("@every-app/sdk/server"),
++    import("@/server/lib/gateway-attribution"),
++  ]);
+   // everyApp() also drops any Set-Cookie on the way out.
+   return everyApp<Env>((verified, _env, _ctx, user) =>
+     serveEveryAppRequest(verified, user, () =>
+@@ -190,18 +214,28 @@ async function handleAppRequest(
+   setRuntimeAuthMode(env.AUTH_MODE);
+   const publicRequest = requestWithPublicOrigin(request);
+   const pathname = new URL(publicRequest.url).pathname;
+-  ctx.waitUntil(maybeSendSelfHostHeartbeat(pathname));
++  ctx.waitUntil(
++    import("@/server/lib/self-host-telemetry").then(
++      ({ maybeSendSelfHostHeartbeat }) => maybeSendSelfHostHeartbeat(pathname),
++    ),
++  );
+ 
+   // Standalone Docker operator tooling (account commands, legacy import).
+   // Both handlers answer 404 without the operator secret; the block is also
+   // what keeps hosted from paying a KV read per request.
+   if (hasOperatorSecret()) {
++    const { handleImport, isLegacyImportActive } = await import(
++      "@/server/standalone/import"
++    );
+     if (pathname === "/api/standalone/import")
+       return handleImport(publicRequest);
+     if (await isLegacyImportActive()) {
+       return new Response("Data import in progress", { status: 503 });
+     }
+     if (pathname === "/api/standalone/admin") {
++      const { handleOperatorRequest } = await import(
++        "@/server/standalone/admin"
++      );
+       return handleOperatorRequest(publicRequest);
+     }
+   }
+@@ -218,11 +252,14 @@ async function handleAppRequest(
+   }
+ 
+   if (isHostedAuthMode(authMode) && pathname === AUTUMN_WEBHOOK_PATH) {
++    const { handleAutumnWebhookRequest } = await import(
++      "@/server/billing/autumn-webhook"
++    );
+     return handleAutumnWebhookRequest(publicRequest);
+   }
+ 
+   if (usesBetterAuth(authMode)) {
+-    return openSeoOAuthProvider.fetch(
++    return (await getOpenSeoOAuthProvider()).fetch(
+       publicRequest,
+       env as OpenSeoOAuthEnv,
+       ctx,
+@@ -262,13 +299,18 @@ export default {
+     _ctx: ExecutionContext,
+   ) {
+     // A legacy Docker import owns the database until it finishes.
+-    if (hasOperatorSecret() && (await isLegacyImportActive())) return;
++    if (hasOperatorSecret()) {
++      const { isLegacyImportActive } = await import(
++        "@/server/standalone/import"
++      );
++      if (await isLegacyImportActive()) return;
++    }
+     if (controller.cron === MCP_OAUTH_PURGE_CRON) {
+       const authMode = getAuthMode(env.AUTH_MODE);
+       // Only the modes with their own accounts run the OAuth provider (and
+       // have OAUTH_KV bound).
+       if (usesBetterAuth(authMode)) {
+-        const result = await openSeoOAuthProvider.purgeExpiredData(
++        const result = await (await getOpenSeoOAuthProvider()).purgeExpiredData(
+           env as OpenSeoOAuthEnv,
+         );
+         console.log("[mcp-oauth] purged expired OAuth data", result);
+@@ -277,6 +319,9 @@ export default {
+         // Daily referral-sale sweep: catches paid Autumn invoices the
+         // billing.updated webhook path misses (renewals, one-time top-ups).
+         try {
++          const { sweepDubReferredOrganizations } = await import(
++            "@/server/referrals/dub"
++          );
+           await sweepDubReferredOrganizations();
+         } catch (err) {
+           console.error("[cron] Dub referral sale sweep failed:", err);
+@@ -287,7 +332,7 @@ export default {
+         try {
+           const { purgeUnusedGoogleData } =
+             await import("@/server/features/google/googleDataRetention");
+-          const purged = await withPgClient(() => purgeUnusedGoogleData());
++          const purged = await withPgClientLazy(() => purgeUnusedGoogleData());
+           console.log("[retention] purged unused Google data", purged);
+         } catch (err) {
+           console.error("[cron] Google data cleanup failed:", err);
+@@ -297,7 +342,7 @@ export default {
+         try {
+           const { AccountDeletionService } =
+             await import("@/server/account-deletion/AccountDeletionService");
+-          const result = await withPgClient(() =>
++          const result = await withPgClientLazy(() =>
+             AccountDeletionService.runDueDeletions(),
+           );
+           console.log("[account-deletion] daily run", result);
+@@ -313,9 +358,15 @@ export default {
+     // before the rank loop so a slow tick can't delay or starve it. Its
+     // failure is held until after the rank checks so it can't suppress them,
+     // then rethrown so the invocation still reports as failed.
++    const [{ reconcileStaleAudits }, { runScheduledRankChecks }, { sendFirstAuditEmails }] =
++      await Promise.all([
++        import("@/server/features/audit/services/auditReconciler"),
++        import("@/server/features/rank-tracking/services/scheduledRankChecks"),
++        import("@/server/features/audit/services/firstAuditEmails"),
++      ]);
+     let watchdogError: unknown;
+     try {
+-      await withPgClient(() => reconcileStaleAudits());
++      await withPgClientLazy(() => reconcileStaleAudits());
+     } catch (err) {
+       watchdogError = err;
+       console.error("[cron] Stale-audit reconcile failed:", err);
+@@ -325,13 +376,13 @@ export default {
+     // the organization that owns the tracker, which every gateway call the
+     // run makes names (gateway-attribution.ts).
+     const checks = await Promise.allSettled([
+-      withPgClient(() => runScheduledRankChecks(env)),
+-      withPgClient(async () => {
++      withPgClientLazy(() => runScheduledRankChecks(env)),
++      withPgClientLazy(async () => {
+         const { runScheduledAiVisibility } =
+           await import("@/server/features/ai-visibility/services/scheduledAiVisibility");
+         await runScheduledAiVisibility();
+       }),
+-      withPgClient(() => sendFirstAuditEmails()),
++      withPgClientLazy(() => sendFirstAuditEmails()),
+     ]);
+     for (const result of checks)
+       if (result.status === "rejected") throw result.reason;
+diff --git a/src/server/billing/autumn-webhook-path.ts b/src/server/billing/autumn-webhook-path.ts
+new file mode 100644
+index 0000000..2e2fe99
+--- /dev/null
++++ b/src/server/billing/autumn-webhook-path.ts
+@@ -0,0 +1,3 @@
++// Kept separate from autumn-webhook.ts so the worker entry can route the
++// webhook without evaluating the billing/PostHog/Dub graph behind the handler.
++export const AUTUMN_WEBHOOK_PATH = "/api/autumn/webhook";
+diff --git a/src/server/billing/autumn-webhook.ts b/src/server/billing/autumn-webhook.ts
+index eaa1e01..54c5310 100644
+--- a/src/server/billing/autumn-webhook.ts
++++ b/src/server/billing/autumn-webhook.ts
+@@ -9,7 +9,7 @@ import {
+ import { syncAutumnCustomerStatus } from "./customer-status-sync";
+ import { verifySvixSignature } from "./svix";
+ 
+-export const AUTUMN_WEBHOOK_PATH = "/api/autumn/webhook";
++export { AUTUMN_WEBHOOK_PATH } from "./autumn-webhook-path";
+ 
+ const autumnWebhookPayloadSchema = z
+   .object({
+diff --git a/src/server/features/ai-visibility/services/aiPromptResearch.test.ts b/src/server/features/ai-visibility/services/aiPromptResearch.test.ts
+index 3df1459..e9bd558 100644
+--- a/src/server/features/ai-visibility/services/aiPromptResearch.test.ts
++++ b/src/server/features/ai-visibility/services/aiPromptResearch.test.ts
+@@ -28,7 +28,7 @@ vi.mock("ai", () => ({
+   generateText,
+   Output: { object: (value: unknown) => value },
+ }));
+-vi.mock("@/server/lib/openrouter", () => ({
++vi.mock("@/server/lib/openrouter-impl", () => ({
+   buildChatAgentModel: vi.fn(),
+   requireOpenRouterAccess: async () => ({ apiKey: "key" }),
+ }));
+diff --git a/src/server/features/ai-visibility/services/aiPromptResearch.ts b/src/server/features/ai-visibility/services/aiPromptResearch.ts
+index 7deab15..a88b3c3 100644
+--- a/src/server/features/ai-visibility/services/aiPromptResearch.ts
++++ b/src/server/features/ai-visibility/services/aiPromptResearch.ts
+@@ -21,7 +21,7 @@ import {
+   buildChatAgentModel,
+   requireOpenRouterAccess,
+   type OpenRouterAccess,
+-} from "@/server/lib/openrouter";
++} from "@/server/lib/openrouter-impl";
+ import { buildCacheKey, getCached, setCached } from "@/server/lib/r2-cache";
+ import {
+   getOptionalEnvValue,
+diff --git a/src/server/features/ai-visibility/services/aiPromptSuggestions.ts b/src/server/features/ai-visibility/services/aiPromptSuggestions.ts
+index 1e16bcd..36b74a3 100644
+--- a/src/server/features/ai-visibility/services/aiPromptSuggestions.ts
++++ b/src/server/features/ai-visibility/services/aiPromptSuggestions.ts
+@@ -12,7 +12,7 @@ import { requireOpenRouterCostUsd } from "@/server/lib/chatAgent";
+ import {
+   buildChatAgentModel,
+   requireOpenRouterAccess,
+-} from "@/server/lib/openrouter";
++} from "@/server/lib/openrouter-impl";
+ import {
+   getOptionalEnvValue,
+   isHostedServerAuthMode,
+diff --git a/src/server/features/projects/services/websiteResearch.test.ts b/src/server/features/projects/services/websiteResearch.test.ts
+index 97c76f6..7e485b9 100644
+--- a/src/server/features/projects/services/websiteResearch.test.ts
++++ b/src/server/features/projects/services/websiteResearch.test.ts
+@@ -38,7 +38,7 @@ vi.mock("@/server/lib/runtime-env", () => ({
+   getRequiredEnvValue: vi.fn(),
+   getOptionalEnvValue: vi.fn(),
+ }));
+-vi.mock("@/server/lib/openrouter", () => ({
++vi.mock("@/server/lib/openrouter-impl", () => ({
+   buildChatAgentModel: vi.fn(),
+   requireOpenRouterAccess: vi.fn(async () => ({ apiKey: "test-key" })),
+ }));
+diff --git a/src/server/features/projects/services/websiteResearch.ts b/src/server/features/projects/services/websiteResearch.ts
+index 3476e60..395d3bf 100644
+--- a/src/server/features/projects/services/websiteResearch.ts
++++ b/src/server/features/projects/services/websiteResearch.ts
+@@ -19,7 +19,7 @@ import { AppError } from "@/server/lib/errors";
+ import {
+   buildChatAgentModel,
+   requireOpenRouterAccess,
+-} from "@/server/lib/openrouter";
++} from "@/server/lib/openrouter-impl";
+ import { getOptionalEnvValue } from "@/server/lib/runtime-env";
+ import { readSite } from "@/server/lib/scrape";
+ import {
+diff --git a/src/server/features/sam/SamChatAgent.ts b/src/server/features/sam/SamChatAgent.ts
+index c4143a4..3f00605 100644
+--- a/src/server/features/sam/SamChatAgent.ts
++++ b/src/server/features/sam/SamChatAgent.ts
+@@ -15,18 +15,10 @@ import { clearChatTerminal } from "agents/chat";
+ import { createCompactFunction } from "agents/sessions";
+ import { generateText, type UIMessage } from "ai";
+ import { z } from "zod";
+-import { eq } from "drizzle-orm";
+-import { db, withPgClient } from "@/db";
+-import { user } from "@/db/schema";
+ import {
+   openRouterCostUsd,
+   staticAssistantModel,
+ } from "@/server/lib/chatAgent";
+-import { SamSessionRepository } from "@/server/features/sam/SamSessionRepository";
+-import { ProjectContextService } from "@/server/features/project-context/services/ProjectContextService";
+-import { ProjectRepository } from "@/server/features/projects/repositories/ProjectRepository";
+-import { buildSamSkillSource } from "@/server/features/sam/samSkills";
+-import { buildSamSystemPrompt } from "@/server/features/sam/samSystemPrompt";
+ import {
+   SamTelemetry,
+   type SamTurnStats,
+@@ -36,15 +28,47 @@ import {
+   isHostedServerAuthMode,
+   usesBetterAuthServer,
+ } from "@/server/lib/runtime-env";
+-import {
+-  checkUsageCreditsDepleted,
+-  trackUsageCreditSpend,
+-} from "@/server/billing/subscription";
+ import { getPublicOrigin } from "@/server/mcp/public-origin";
+ import { MCP_SCOPE } from "@/lib/oauth-resource";
+-import { AuthRepository } from "@/server/auth/repositories/AuthRepository";
+ import type { ToolAuthContext } from "@/server/mcp/context";
+ 
++// The DO class itself must be in the entry module, but everything it reaches
++// only while serving a turn can load then: the isolate's startup budget no
++// longer pays for the database, repository, billing and skill-parsing graphs
++// of a chat session that no request has opened yet.
++function lazyModule<T>(load: () => Promise<T>): () => Promise<T> {
++  let modulePromise: Promise<T> | undefined;
++  return () => (modulePromise ??= load());
++}
++
++const dbModule = lazyModule(() => import("@/db"));
++const samSessionRepositoryModule = lazyModule(
++  () => import("@/server/features/sam/SamSessionRepository"),
++);
++const projectRepositoryModule = lazyModule(
++  () => import("@/server/features/projects/repositories/ProjectRepository"),
++);
++const projectContextServiceModule = lazyModule(
++  () => import("@/server/features/project-context/services/ProjectContextService"),
++);
++const samSystemPromptModule = lazyModule(
++  () => import("@/server/features/sam/samSystemPrompt"),
++);
++const samSkillsModule = lazyModule(
++  () => import("@/server/features/sam/samSkills"),
++);
++const subscriptionModule = lazyModule(
++  () => import("@/server/billing/subscription"),
++);
++const authRepositoryModule = lazyModule(
++  () => import("@/server/auth/repositories/AuthRepository"),
++);
++
++async function withPgClientScoped<T>(fn: () => Promise<T>): Promise<T> {
++  const { withPgClient } = await dbModule();
++  return withPgClient(fn);
++}
++
+ // SAM's read-only view of the project's shared memory. The block has no `set`
+ // provider, so Think exposes no set_context tool for it; writes go through the
+ // update_project_context tool, the same one MCP clients and the settings UI use.
+@@ -95,13 +119,14 @@ function firstUserText(messages: UIMessage[]): string {
+   return textPart?.text ?? "";
+ }
+ 
++type SamSessionRepository = typeof import("@/server/features/sam/SamSessionRepository").SamSessionRepository;
++type ProjectRepository = typeof import("@/server/features/projects/repositories/ProjectRepository").ProjectRepository;
++
+ type SamContext = {
+   row: NonNullable<
+-    Awaited<ReturnType<typeof SamSessionRepository.getSessionById>>
+-  >;
+-  project: NonNullable<
+-    Awaited<ReturnType<typeof ProjectRepository.getProjectById>>
++    Awaited<ReturnType<SamSessionRepository["getSessionById"]>>
+   >;
++  project: NonNullable<Awaited<ReturnType<ProjectRepository["getProjectById"]>>>;
+   // The session row is normalized (project/user ids only); the creating
+   // user's current email is resolved here for the billing/MCP auth context.
+   userEmail: string;
+@@ -151,7 +176,7 @@ export class SamChatAgent extends Think {
+   // error, or a memory-limit kill surfacing as recovery).
+   private readonly telemetry = new SamTelemetry(
+     () => this.name,
+-    () => withPgClient(() => this.loadSamContext()),
++    () => withPgClientScoped(() => this.loadSamContext()),
+     (promise) => this.ctx.waitUntil(promise),
+   );
+ 
+@@ -196,7 +221,8 @@ export class SamChatAgent extends Think {
+     return buildSamChatModel(this.env, reasoningEffort);
+   }
+ 
+-  override getSkills() {
++  override async getSkills() {
++    const { buildSamSkillSource } = await samSkillsModule();
+     return [buildSamSkillSource()];
+   }
+ 
+@@ -236,6 +262,19 @@ export class SamChatAgent extends Think {
+ 
+   private async loadSamContext(): Promise<SamContext | null> {
+     if (this.samContext) return this.samContext;
++    const [
++      { SamSessionRepository },
++      { ProjectRepository },
++      { db },
++      { user },
++      { eq },
++    ] = await Promise.all([
++      samSessionRepositoryModule(),
++      projectRepositoryModule(),
++      dbModule(),
++      import("@/db/schema"),
++      import("drizzle-orm"),
++    ]);
+     const row = await SamSessionRepository.getSessionById(this.name);
+     if (!row) return null;
+     const project = await ProjectRepository.getProjectById(row.projectId);
+@@ -254,11 +293,16 @@ export class SamChatAgent extends Think {
+   // project-memory block, so it re-renders (fresh project row, intake mode
+   // on/off) whenever the prompt is refreshed.
+   private buildSoulPrompt(): Promise<string> {
+-    return withPgClient(async () => {
++    return withPgClientScoped(async () => {
+       const ctx = await this.loadSamContext();
+       if (!ctx) {
+         return "You are SAM, the SEO agent inside OpenSEO. This chat session no longer exists; tell the user to start a new chat.";
+       }
++      const [{ ProjectContextService }, { buildSamSystemPrompt }] =
++        await Promise.all([
++          projectContextServiceModule(),
++          samSystemPromptModule(),
++        ]);
+       const context = await ProjectContextService.getProjectContext(
+         ctx.project.id,
+       );
+@@ -280,9 +324,10 @@ export class SamChatAgent extends Think {
+   // invoked from Think's internals, so no ambient withPgClient scope can be
+   // assumed (no-op in D1 mode).
+   private renderProjectContext(): Promise<string | null> {
+-    return withPgClient(async () => {
++    return withPgClientScoped(async () => {
+       const ctx = await this.loadSamContext();
+       if (!ctx) return null;
++      const { ProjectContextService } = await projectContextServiceModule();
+       return ProjectContextService.renderProjectContextMarkdown(
+         await ProjectContextService.getProjectContext(ctx.project.id),
+       );
+@@ -305,7 +350,7 @@ export class SamChatAgent extends Think {
+     // spend either way.
+     this.turnMonthlyRemaining = null;
+     const turn = this.telemetry.beginTurn(turnCtx.continuation);
+-    return withPgClient(async (): Promise<TurnConfig> => {
++    return withPgClientScoped(async (): Promise<TurnConfig> => {
+       const ctx = await this.loadSamContext();
+       if (!ctx) {
+         turn.refusal = "no_session";
+@@ -322,6 +367,7 @@ export class SamChatAgent extends Think {
+       // stale check reading here once locked a paying customer out of chat.
+       const { organizationId } = ctx.project;
+       const hosted = await isHostedServerAuthMode();
++      const { checkUsageCreditsDepleted } = await subscriptionModule();
+       if (hosted) {
+         const gate = await checkUsageCreditsDepleted({
+           userId: ctx.row.userId,
+@@ -348,10 +394,9 @@ export class SamChatAgent extends Think {
+       // the open socket keep owner-level tools (WebSockets authorize at
+       // connect time only, so this per-turn check is what actually revokes a
+       // removed member's chat).
+-      const membership = await AuthRepository.getMembership(
+-        ctx.row.userId,
+-        organizationId,
+-      );
++      const membership = await (
++        await authRepositoryModule()
++      ).AuthRepository.getMembership(ctx.row.userId, organizationId);
+       if ((await usesBetterAuthServer()) && !membership) {
+         turn.refusal = "no_access";
+         return this.refusalTurn(
+@@ -417,11 +462,12 @@ export class SamChatAgent extends Think {
+     armedMonthlyRemaining: number,
+     turn: SamTurnStats | null,
+   ): Promise<void> {
+-    const ctx = await withPgClient(() => this.loadSamContext());
++    const ctx = await withPgClientScoped(() => this.loadSamContext());
+     if (!ctx) return;
+     // Earlier chunks in the chain have already drawn the monthly balance
+     // down; the value captured at enqueue time only covers a flush that
+     // outlives its turn (onChatError), where the field has been re-armed.
++    const { trackUsageCreditSpend } = await subscriptionModule();
+     const { monthlyCredits, topupCredits } = await trackUsageCreditSpend({
+       customer: {
+         userId: ctx.row.userId,
+@@ -451,9 +497,10 @@ export class SamChatAgent extends Think {
+       ),
+     );
+ 
+-    await withPgClient(async () => {
++    await withPgClientScoped(async () => {
+       const ctx = await this.loadSamContext();
+       if (!ctx) return;
++      const { SamSessionRepository } = await samSessionRepositoryModule();
+ 
+       // Name the session from its first message so the side-panel is readable.
+       if (ctx.row.title === "New chat") {
+@@ -472,7 +519,7 @@ export class SamChatAgent extends Think {
+     // turn. One withPgClient scope covers both providers (their own defensive
+     // scopes reuse it). Best-effort — never fail the response.
+     if (result.status === "completed") {
+-      await withPgClient(() => this.session.refreshSystemPrompt()).catch(
++      await withPgClientScoped(() => this.session.refreshSystemPrompt()).catch(
+         (error: unknown) => {
+           console.error("[sam] context refresh failed", error);
+         },
+diff --git a/src/server/lib/openrouter-impl.ts b/src/server/lib/openrouter-impl.ts
+new file mode 100644
+index 0000000..e64ca38
+--- /dev/null
++++ b/src/server/lib/openrouter-impl.ts
+@@ -0,0 +1,202 @@
++import { ConfigurationError, createGatewayFetch } from "@every-app/sdk/server";
++import {
++  createOpenRouter,
++  type LanguageModelV3,
++  type OpenRouterProvider,
++} from "@openrouter/ai-sdk-provider";
++import { wrapLanguageModel } from "ai";
++import { isEveryAppAuthMode } from "@/lib/auth-mode";
++import { gatewayCallFor } from "@/server/lib/gateway-attribution";
++import { getEnvValueSync, getWorkersEnv } from "@/server/lib/runtime-env";
++
++/**
++ * How a deployment reaches OpenRouter: with its own key, or behind an Every
++ * App gateway (AUTH_MODE=everyapp) through the gateway's AI proxy, which
++ * holds the key. The proxy's host is a placeholder the binding never
++ * resolves.
++ */
++export type OpenRouterAccess =
++  | { apiKey: string; baseURL?: string }
++  | { gatewayFetch: typeof fetch };
++
++const GATEWAY_BASE_URL =
++  "https://every-app-gateway.invalid/api/ai/openrouter/api/v1";
++
++function isBehindEveryAppGateway(env: object): boolean {
++  return isEveryAppAuthMode(getEnvValueSync(env, "AUTH_MODE"));
++}
++
++/** The gateway's AI proxy fetch (whose call it is: gateway-attribution.ts). */
++function gatewayOpenRouterFetch(env: object): typeof fetch {
++  return createGatewayFetch({
++    env,
++    for: gatewayCallFor(),
++  });
++}
++
++/**
++ * This deployment's OpenRouter access, or null without one. Sync for
++ * samAccess.
++ */
++export function getOpenRouterAccess(env: object): OpenRouterAccess | null {
++  if (isBehindEveryAppGateway(env)) {
++    try {
++      return { gatewayFetch: gatewayOpenRouterFetch(env) };
++    } catch (error) {
++      // No gateway binding (and no local key in dev). A call that says
++      // nobody's (AttributionError) is a bug, so it is thrown.
++      if (error instanceof ConfigurationError) return null;
++      throw error;
++    }
++  }
++  const apiKey = getEnvValueSync(env, "OPENROUTER_API_KEY");
++  // Any OpenAI-compatible endpoint that speaks OpenRouter's chat API; unset
++  // means OpenRouter itself.
++  const baseURL = getEnvValueSync(env, "OPENROUTER_BASE_URL");
++  return apiKey ? { apiKey, baseURL } : null;
++}
++
++/** SAM's model, from its Durable Object env. Sync: Think's getModel() is. */
++export function buildSamChatModel(
++  env: object,
++  reasoningEffort: "max" | "low",
++): LanguageModelV3 {
++  const access = getOpenRouterAccess(env);
++  if (!access) {
++    throw new Error("OPENROUTER_API_KEY is required for the SAM agent");
++  }
++  return buildChatAgentModel(
++    access,
++    getEnvValueSync(env, "OPENROUTER_MODEL"),
++    reasoningEffort,
++  );
++}
++
++/** For server code: the access, or the error a missing key always threw. */
++export async function requireOpenRouterAccess(): Promise<OpenRouterAccess> {
++  const access = getOpenRouterAccess((await getWorkersEnv()) ?? {});
++  if (!access) {
++    throw new Error(
++      "Missing required environment variable: OPENROUTER_API_KEY",
++    );
++  }
++  return access;
++}
++
++// OpenRouter model slug used for the SAM in-app chat agent. Override with
++// OPENROUTER_MODEL to swap models without a code change.
++const DEFAULT_CHAT_AGENT_MODEL = "openai/gpt-5.6-luna";
++
++// Previous default; kept reachable via OPENROUTER_MODEL for rollback, and the
++// fallback where OpenAI is blocked. Its routing needs the ZDR/provider tuning
++// below.
++const MINIMAX_M3 = "minimax/minimax-m3";
++
++// OpenRouter rejects OpenAI models for requests from these countries ("This
++// model is not available in your region"). Workflows and Durable Objects run
++// near the user, outside prod's US placement.
++const OPENAI_BLOCKED_COUNTRIES = [
++  "CN",
++  "HK",
++  "MO",
++  "RU",
++  "BY",
++  "IR",
++  "KP",
++  "SY",
++  "CU",
++];
++
++// The country this isolate's requests leave from. An isolate stays in one
++// location, so one lookup serves its lifetime. Caches the value, not the
++// promise: Workers can't share a pending fetch across requests. Fails open: a
++// slow or failed lookup leaves the country unknown, and calls stay on OpenAI.
++let egressCountry: string | undefined;
++async function openAiBlockedHere(): Promise<boolean> {
++  egressCountry ??= await fetch("https://www.cloudflare.com/cdn-cgi/trace", {
++    signal: AbortSignal.timeout(2000),
++  })
++    .then((response) => response.text())
++    .then((trace) => /^loc=(\w+)$/m.exec(trace)?.[1] ?? "")
++    .catch(() => "");
++  return OPENAI_BLOCKED_COUNTRIES.includes(egressCountry);
++}
++
++/**
++ * Returns the AI SDK LanguageModel for the chat agent. `usage: { include: true }`
++ * turns on OpenRouter usage accounting so each response carries its real USD
++ * cost (providerMetadata.openrouter.usage.cost) — which we meter against the
++ * shared usage-credit pool.
++ *
++ * Default model: GPT-5.6 Luna at `reasoning.effort: "max"` — "max" is valid at
++ * the OpenRouter API for GPT-5.x but missing from the SDK's effort union, so
++ * the reasoning config rides in `extraBody`. Reasoning tokens stream on the
++ * separate reasoning channel and are billed as output tokens, which the usage
++ * accounting above captures.
++ *
++ * Sync on purpose: Think's `getModel()` hook is sync and runs on every turn,
++ * so the SAM agent reads its access/model from its DO env and builds here.
++ */
++export function buildChatAgentModel(
++  access: OpenRouterAccess,
++  modelId?: string,
++  reasoningEffort: "max" | "low" = "max",
++): LanguageModelV3 {
++  const model = modelId ?? DEFAULT_CHAT_AGENT_MODEL;
++  const openrouter =
++    "apiKey" in access
++      ? createOpenRouter({ apiKey: access.apiKey, baseURL: access.baseURL })
++      : createOpenRouter({
++          apiKey: "gateway-managed",
++          baseURL: GATEWAY_BASE_URL,
++          fetch: access.gatewayFetch,
++        });
++  const primary = openRouterModel(openrouter, model, reasoningEffort);
++  // The MiniMax fallback is an OpenRouter slug; another provider may not have it.
++  if (!model.startsWith("openai/") || ("apiKey" in access && access.baseURL)) {
++    return primary;
++  }
++  // Where OpenRouter would reject OpenAI, pick MiniMax M3 before the request.
++  // The country lookup is async and getModel() is sync, so it runs per call.
++  const fallback = openRouterModel(openrouter, MINIMAX_M3, reasoningEffort);
++  const pick = async () => ((await openAiBlockedHere()) ? fallback : primary);
++  return wrapLanguageModel({
++    model: primary,
++    middleware: {
++      specificationVersion: "v3",
++      wrapGenerate: async ({ params }) => (await pick()).doGenerate(params),
++      wrapStream: async ({ params }) => (await pick()).doStream(params),
++    },
++  });
++}
++
++function openRouterModel(
++  openrouter: OpenRouterProvider,
++  model: string,
++  reasoningEffort: "max" | "low",
++): LanguageModelV3 {
++  // MiniMax M3 (env override or OpenAI fallback): `provider.order` prefers
++  // Together, then Atlas Cloud (fp8); `zdr: true` restricts routing to Zero-Data-
++  // Retention endpoints, which excludes MiniMax first-party — the account's
++  // "Non-frontier requires ZDR" data policy enforces the same, this flag is
++  // belt-and-braces. Fallbacks stay on within the ZDR set because pinning
++  // providers caused a prod outage (Jul 2026: Together upstream-rate-limited
++  // m3 and every chat turn 429'd). The explicit reasoning channel keeps m3's
++  // `<think>` trace out of the visible answer text.
++  if (model === MINIMAX_M3) {
++    return openrouter(model, {
++      usage: { include: true },
++      reasoning: { effort: reasoningEffort === "low" ? "low" : "medium" },
++      provider: {
++        order: ["together", "atlas-cloud/fp8"],
++        zdr: true,
++        allow_fallbacks: true,
++      },
++    });
++  }
++
++  return openrouter(model, {
++    usage: { include: true },
++    extraBody: { reasoning: { effort: reasoningEffort } },
++  });
++}
+diff --git a/src/server/lib/openrouter.test.ts b/src/server/lib/openrouter.test.ts
+index 5925a27..e060aca 100644
+--- a/src/server/lib/openrouter.test.ts
++++ b/src/server/lib/openrouter.test.ts
+@@ -23,7 +23,7 @@ async function requestedModel(trace: () => Promise<Response>) {
+     .spyOn(globalThis, "fetch")
+     .mockImplementationOnce(trace)
+     .mockResolvedValueOnce(completion());
+-  const { buildChatAgentModel } = await import("./openrouter");
++  const { buildChatAgentModel } = await import("./openrouter-impl");
+   await generateText({
+     model: buildChatAgentModel({ apiKey: "key" }),
+     prompt: "hi",
+@@ -44,7 +44,7 @@ it("sends requests to a custom base URL without the region lookup", async () =>
+   const fetchMock = vi
+     .spyOn(globalThis, "fetch")
+     .mockResolvedValueOnce(completion());
+-  const { buildChatAgentModel } = await import("./openrouter");
++  const { buildChatAgentModel } = await import("./openrouter-impl");
+   await generateText({
+     model: buildChatAgentModel({
+       apiKey: "key",
+diff --git a/src/server/lib/openrouter.ts b/src/server/lib/openrouter.ts
+index e64ca38..d931496 100644
+--- a/src/server/lib/openrouter.ts
++++ b/src/server/lib/openrouter.ts
+@@ -1,202 +1,40 @@
+-import { ConfigurationError, createGatewayFetch } from "@every-app/sdk/server";
+-import {
+-  createOpenRouter,
+-  type LanguageModelV3,
+-  type OpenRouterProvider,
+-} from "@openrouter/ai-sdk-provider";
+-import { wrapLanguageModel } from "ai";
++import type { LanguageModelV3 } from "@openrouter/ai-sdk-provider";
+ import { isEveryAppAuthMode } from "@/lib/auth-mode";
+-import { gatewayCallFor } from "@/server/lib/gateway-attribution";
+-import { getEnvValueSync, getWorkersEnv } from "@/server/lib/runtime-env";
++import { getEnvValueSync } from "@/server/lib/runtime-env";
+ 
+-/**
+- * How a deployment reaches OpenRouter: with its own key, or behind an Every
+- * App gateway (AUTH_MODE=everyapp) through the gateway's AI proxy, which
+- * holds the key. The proxy's host is a placeholder the binding never
+- * resolves.
+- */
+-export type OpenRouterAccess =
+-  | { apiKey: string; baseURL?: string }
+-  | { gatewayFetch: typeof fetch };
+-
+-const GATEWAY_BASE_URL =
+-  "https://every-app-gateway.invalid/api/ai/openrouter/api/v1";
+-
+-function isBehindEveryAppGateway(env: object): boolean {
+-  return isEveryAppAuthMode(getEnvValueSync(env, "AUTH_MODE"));
+-}
+-
+-/** The gateway's AI proxy fetch (whose call it is: gateway-attribution.ts). */
+-function gatewayOpenRouterFetch(env: object): typeof fetch {
+-  return createGatewayFetch({
+-    env,
+-    for: gatewayCallFor(),
+-  });
+-}
+-
+-/**
+- * This deployment's OpenRouter access, or null without one. Sync for
+- * samAccess.
+- */
+-export function getOpenRouterAccess(env: object): OpenRouterAccess | null {
+-  if (isBehindEveryAppGateway(env)) {
+-    try {
+-      return { gatewayFetch: gatewayOpenRouterFetch(env) };
+-    } catch (error) {
+-      // No gateway binding (and no local key in dev). A call that says
+-      // nobody's (AttributionError) is a bug, so it is thrown.
+-      if (error instanceof ConfigurationError) return null;
+-      throw error;
+-    }
+-  }
+-  const apiKey = getEnvValueSync(env, "OPENROUTER_API_KEY");
+-  // Any OpenAI-compatible endpoint that speaks OpenRouter's chat API; unset
+-  // means OpenRouter itself.
+-  const baseURL = getEnvValueSync(env, "OPENROUTER_BASE_URL");
+-  return apiKey ? { apiKey, baseURL } : null;
+-}
++// `buildSamChatModel` is called from Think's synchronous getModel() hook, but
++// the OpenRouter provider package and the Every App gateway client are only
++// needed once the model actually runs. Return a model-shaped proxy that loads
++// the real implementation on first use, so the worker entry's eager graph no
++// longer evaluates either (the two packages are ~0.7 MB of source).
++const DEFAULT_CHAT_AGENT_MODEL = "openai/gpt-5.6-luna";
+ 
+-/** SAM's model, from its Durable Object env. Sync: Think's getModel() is. */
+ export function buildSamChatModel(
+   env: object,
+   reasoningEffort: "max" | "low",
+ ): LanguageModelV3 {
+-  const access = getOpenRouterAccess(env);
+-  if (!access) {
++  // Keep the immediate configuration error for the common non-gateway path;
++  // the lazy implementation re-checks through the same access helper.
++  if (
++    !isEveryAppAuthMode(getEnvValueSync(env, "AUTH_MODE")) &&
++    !getEnvValueSync(env, "OPENROUTER_API_KEY")
++  ) {
+     throw new Error("OPENROUTER_API_KEY is required for the SAM agent");
+   }
+-  return buildChatAgentModel(
+-    access,
+-    getEnvValueSync(env, "OPENROUTER_MODEL"),
+-    reasoningEffort,
+-  );
+-}
+-
+-/** For server code: the access, or the error a missing key always threw. */
+-export async function requireOpenRouterAccess(): Promise<OpenRouterAccess> {
+-  const access = getOpenRouterAccess((await getWorkersEnv()) ?? {});
+-  if (!access) {
+-    throw new Error(
+-      "Missing required environment variable: OPENROUTER_API_KEY",
+-    );
+-  }
+-  return access;
+-}
+-
+-// OpenRouter model slug used for the SAM in-app chat agent. Override with
+-// OPENROUTER_MODEL to swap models without a code change.
+-const DEFAULT_CHAT_AGENT_MODEL = "openai/gpt-5.6-luna";
+-
+-// Previous default; kept reachable via OPENROUTER_MODEL for rollback, and the
+-// fallback where OpenAI is blocked. Its routing needs the ZDR/provider tuning
+-// below.
+-const MINIMAX_M3 = "minimax/minimax-m3";
+-
+-// OpenRouter rejects OpenAI models for requests from these countries ("This
+-// model is not available in your region"). Workflows and Durable Objects run
+-// near the user, outside prod's US placement.
+-const OPENAI_BLOCKED_COUNTRIES = [
+-  "CN",
+-  "HK",
+-  "MO",
+-  "RU",
+-  "BY",
+-  "IR",
+-  "KP",
+-  "SY",
+-  "CU",
+-];
+-
+-// The country this isolate's requests leave from. An isolate stays in one
+-// location, so one lookup serves its lifetime. Caches the value, not the
+-// promise: Workers can't share a pending fetch across requests. Fails open: a
+-// slow or failed lookup leaves the country unknown, and calls stay on OpenAI.
+-let egressCountry: string | undefined;
+-async function openAiBlockedHere(): Promise<boolean> {
+-  egressCountry ??= await fetch("https://www.cloudflare.com/cdn-cgi/trace", {
+-    signal: AbortSignal.timeout(2000),
+-  })
+-    .then((response) => response.text())
+-    .then((trace) => /^loc=(\w+)$/m.exec(trace)?.[1] ?? "")
+-    .catch(() => "");
+-  return OPENAI_BLOCKED_COUNTRIES.includes(egressCountry);
+-}
+-
+-/**
+- * Returns the AI SDK LanguageModel for the chat agent. `usage: { include: true }`
+- * turns on OpenRouter usage accounting so each response carries its real USD
+- * cost (providerMetadata.openrouter.usage.cost) — which we meter against the
+- * shared usage-credit pool.
+- *
+- * Default model: GPT-5.6 Luna at `reasoning.effort: "max"` — "max" is valid at
+- * the OpenRouter API for GPT-5.x but missing from the SDK's effort union, so
+- * the reasoning config rides in `extraBody`. Reasoning tokens stream on the
+- * separate reasoning channel and are billed as output tokens, which the usage
+- * accounting above captures.
+- *
+- * Sync on purpose: Think's `getModel()` hook is sync and runs on every turn,
+- * so the SAM agent reads its access/model from its DO env and builds here.
+- */
+-export function buildChatAgentModel(
+-  access: OpenRouterAccess,
+-  modelId?: string,
+-  reasoningEffort: "max" | "low" = "max",
+-): LanguageModelV3 {
+-  const model = modelId ?? DEFAULT_CHAT_AGENT_MODEL;
+-  const openrouter =
+-    "apiKey" in access
+-      ? createOpenRouter({ apiKey: access.apiKey, baseURL: access.baseURL })
+-      : createOpenRouter({
+-          apiKey: "gateway-managed",
+-          baseURL: GATEWAY_BASE_URL,
+-          fetch: access.gatewayFetch,
+-        });
+-  const primary = openRouterModel(openrouter, model, reasoningEffort);
+-  // The MiniMax fallback is an OpenRouter slug; another provider may not have it.
+-  if (!model.startsWith("openai/") || ("apiKey" in access && access.baseURL)) {
+-    return primary;
+-  }
+-  // Where OpenRouter would reject OpenAI, pick MiniMax M3 before the request.
+-  // The country lookup is async and getModel() is sync, so it runs per call.
+-  const fallback = openRouterModel(openrouter, MINIMAX_M3, reasoningEffort);
+-  const pick = async () => ((await openAiBlockedHere()) ? fallback : primary);
+-  return wrapLanguageModel({
+-    model: primary,
+-    middleware: {
+-      specificationVersion: "v3",
+-      wrapGenerate: async ({ params }) => (await pick()).doGenerate(params),
+-      wrapStream: async ({ params }) => (await pick()).doStream(params),
+-    },
+-  });
+-}
+-
+-function openRouterModel(
+-  openrouter: OpenRouterProvider,
+-  model: string,
+-  reasoningEffort: "max" | "low",
+-): LanguageModelV3 {
+-  // MiniMax M3 (env override or OpenAI fallback): `provider.order` prefers
+-  // Together, then Atlas Cloud (fp8); `zdr: true` restricts routing to Zero-Data-
+-  // Retention endpoints, which excludes MiniMax first-party — the account's
+-  // "Non-frontier requires ZDR" data policy enforces the same, this flag is
+-  // belt-and-braces. Fallbacks stay on within the ZDR set because pinning
+-  // providers caused a prod outage (Jul 2026: Together upstream-rate-limited
+-  // m3 and every chat turn 429'd). The explicit reasoning channel keeps m3's
+-  // `<think>` trace out of the visible answer text.
+-  if (model === MINIMAX_M3) {
+-    return openrouter(model, {
+-      usage: { include: true },
+-      reasoning: { effort: reasoningEffort === "low" ? "low" : "medium" },
+-      provider: {
+-        order: ["together", "atlas-cloud/fp8"],
+-        zdr: true,
+-        allow_fallbacks: true,
+-      },
+-    });
+-  }
+ 
+-  return openrouter(model, {
+-    usage: { include: true },
+-    extraBody: { reasoning: { effort: reasoningEffort } },
+-  });
++  let model: Promise<LanguageModelV3> | undefined;
++  const loadModel = () =>
++    (model ??= import("@/server/lib/openrouter-impl").then(
++      ({ buildSamChatModel: build }) => build(env, reasoningEffort),
++    ));
++
++  return {
++    specificationVersion: "v3",
++    provider: "openrouter",
++    modelId:
++      getEnvValueSync(env, "OPENROUTER_MODEL") ?? DEFAULT_CHAT_AGENT_MODEL,
++    supportedUrls: {},
++    doGenerate: async (options) => (await loadModel()).doGenerate(options),
++    doStream: async (options) => (await loadModel()).doStream(options),
++  };
+ }
+diff --git a/src/server/lib/posthog.ts b/src/server/lib/posthog.ts
+index 5cb6382..54099a9 100644
+--- a/src/server/lib/posthog.ts
++++ b/src/server/lib/posthog.ts
+@@ -1,15 +1,19 @@
+ import { env } from "cloudflare:workers";
+-import { PostHog } from "posthog-node";
++import type { PostHog } from "posthog-node";
+ import { asAppError } from "@/server/lib/errors";
+ import { isHostedServerAuthMode } from "@/server/lib/runtime-env";
+ 
+ /** Returns a one-shot PostHog client, or null if the key is missing. Caller must shut down after use.
+- *  A new instance per call is fine — this runs on Cloudflare Workers where construction cost is negligible. */
+-function getServerPostHogClient(): PostHog | null {
++ *  A new instance per call is fine — this runs on Cloudflare Workers where construction cost is negligible.
++ *  The package is imported here rather than at module scope: this module is
++ *  reachable from the entry worker (SAM telemetry), and posthog-node is only
++ *  needed once a hosted event is actually captured, not at startup. */
++async function getServerPostHogClient(): Promise<PostHog | null> {
+   const apiKey = env.POSTHOG_PUBLIC_KEY?.trim();
+   const host = env.POSTHOG_HOST?.trim();
+   if (!apiKey || !host) return null;
+ 
++  const { PostHog } = await import("posthog-node");
+   return new PostHog(apiKey, {
+     host,
+     flushAt: 1,
+@@ -80,7 +84,7 @@ export async function captureServerError(
+     return;
+   }
+ 
+-  const client = getServerPostHogClient();
++  const client = await getServerPostHogClient();
+   if (!client) return;
+ 
+   try {
+@@ -106,7 +110,7 @@ export async function captureServerEvent(args: {
+     return;
+   }
+ 
+-  const client = getServerPostHogClient();
++  const client = await getServerPostHogClient();
+   if (!client) return;
+ 
+   try {
+diff --git a/src/server/workflows/AiVisibilityWorkflow.ts b/src/server/workflows/AiVisibilityWorkflow.ts
+index 0d2875c..a688fb7 100644
+--- a/src/server/workflows/AiVisibilityWorkflow.ts
++++ b/src/server/workflows/AiVisibilityWorkflow.ts
+@@ -3,29 +3,10 @@ import {
+   type WorkflowEvent,
+   type WorkflowStep,
+ } from "cloudflare:workers";
+-import { pgStep } from "./pgStep";
+ import { yieldingStep } from "./yieldingStep";
+-import {
+-  collectAiLiveBatch,
+-  collectAiModelBatch,
+-  collectAiRound,
+-  collectLateAiAnswers,
+-  postAiBatch,
+-  prepareAiRun,
+-  type AiPendingTask,
+-} from "@/server/features/ai-visibility/services/aiVisibilityCollection";
+-import {
+-  finalizeAiRun,
+-  markAiRunFailed,
+-} from "@/server/features/ai-visibility/services/aiVisibilityRunOutcome";
+-import {
+-  settleAiRun,
+-  type AiPostedHold,
+-} from "@/server/features/ai-visibility/services/aiVisibilityBilling";
+-import { runAiResearchSetup } from "@/server/features/ai-visibility/services/aiResearchKeywords";
++import type { AiPendingTask } from "@/server/features/ai-visibility/services/aiVisibilityCollection";
++import type { AiPostedHold } from "@/server/features/ai-visibility/services/aiVisibilityBilling";
+ import type { BillingCustomerContext } from "@/server/billing/subscription";
+-import { AI_TRACKING_HOLD_TTL_MS } from "@/server/lib/dataforseo";
+-import { describeError } from "@/server/lib/errors";
+ 
+ // One binding serves answer collection runs and the one-time research setup,
+ // so setup needs no new workflow infrastructure.
+@@ -78,7 +59,6 @@ const POLL_INTERVALS = [
+ // up the tracker. Reads stop an hour before the credit hold expires, which
+ // leaves time to settle it; the hold starts after the workflow does.
+ const LATE_READ_INTERVAL_MS = 30 * 60_000;
+-const LATE_READS_FOR_MS = AI_TRACKING_HOLD_TTL_MS - 60 * 60_000;
+ 
+ export class AiVisibilityWorkflow extends WorkflowEntrypoint<
+   Env,
+@@ -88,6 +68,31 @@ export class AiVisibilityWorkflow extends WorkflowEntrypoint<
+     event: WorkflowEvent<AiVisibilityPayload>,
+     engineStep: WorkflowStep,
+   ) {
++    const [
++      { pgStep },
++      {
++        collectAiLiveBatch,
++        collectAiModelBatch,
++        collectAiRound,
++        collectLateAiAnswers,
++        postAiBatch,
++        prepareAiRun,
++      },
++      { finalizeAiRun, markAiRunFailed },
++      { settleAiRun },
++      { runAiResearchSetup },
++      { AI_TRACKING_HOLD_TTL_MS },
++      { describeError },
++    ] = await Promise.all([
++      import("./pgStep"),
++      import("@/server/features/ai-visibility/services/aiVisibilityCollection"),
++      import("@/server/features/ai-visibility/services/aiVisibilityRunOutcome"),
++      import("@/server/features/ai-visibility/services/aiVisibilityBilling"),
++      import("@/server/features/ai-visibility/services/aiResearchKeywords"),
++      import("@/server/lib/dataforseo"),
++      import("@/server/lib/errors"),
++    ]);
++    const LATE_READS_FOR_MS = AI_TRACKING_HOLD_TTL_MS - 60 * 60_000;
+     const step = yieldingStep(engineStep);
+     const { payload } = event;
+     if ("setupProjectId" in payload)
+diff --git a/src/server/workflows/LocalRankWorkflow.ts b/src/server/workflows/LocalRankWorkflow.ts
+index 91ee262..0b3a530 100644
+--- a/src/server/workflows/LocalRankWorkflow.ts
++++ b/src/server/workflows/LocalRankWorkflow.ts
+@@ -4,15 +4,7 @@ import {
+   type WorkflowStep,
+ } from "cloudflare:workers";
+ import type { BillingCustomerContext } from "@/server/billing/subscription";
+-import {
+-  failLocalPoints,
+-  finalizeLocalCheck,
+-  prepareLocalCheck,
+-  searchLocalPoints,
+-} from "@/server/features/local-seo/services/localSeoCollection";
+-import { pgStep } from "./pgStep";
+ import { yieldingStep } from "./yieldingStep";
+-import { describeError } from "@/server/lib/errors";
+ 
+ type LocalRankPayload = {
+   checkId: string;
+@@ -31,6 +23,20 @@ export class LocalRankWorkflow extends WorkflowEntrypoint<
+   LocalRankPayload
+ > {
+   async run(event: WorkflowEvent<LocalRankPayload>, engineStep: WorkflowStep) {
++    const [
++      {
++        failLocalPoints,
++        finalizeLocalCheck,
++        prepareLocalCheck,
++        searchLocalPoints,
++      },
++      { pgStep },
++      { describeError },
++    ] = await Promise.all([
++      import("@/server/features/local-seo/services/localSeoCollection"),
++      import("./pgStep"),
++      import("@/server/lib/errors"),
++    ]);
+     const step = yieldingStep(engineStep);
+     const { checkId, customer } = event.payload;
+     const projectId = customer.projectId;
+diff --git a/src/server/workflows/RankCheckWorkflow.ts b/src/server/workflows/RankCheckWorkflow.ts
+index dd5102a..4a7fa8f 100644
+--- a/src/server/workflows/RankCheckWorkflow.ts
++++ b/src/server/workflows/RankCheckWorkflow.ts
+@@ -4,33 +4,9 @@ import {
+   type WorkflowStep,
+ } from "cloudflare:workers";
+ import { NonRetryableError } from "cloudflare:workflows";
+-import { withPgClient } from "@/db";
+ import { yieldingStep } from "@/server/workflows/yieldingStep";
+ import type { BillingCustomerContext } from "@/server/billing/subscription";
+-import { RankTrackingRepository } from "@/server/features/rank-tracking/repositories/RankTrackingRepository";
+-import { failRunIfActive } from "@/server/features/rank-tracking/services/rankCheckRunGuards";
+-import {
+-  runLiveCheck,
+-  runQueuedCheck,
+-} from "@/server/workflows/rankCheckPaths";
+-import { retryRankChecks } from "@/server/workflows/rankCheckRetries";
+-import { resolveRunGotoUrls } from "@/server/workflows/rankCheckGotoUrls";
+-import { pgStep } from "@/server/workflows/pgStep";
+-import { createDataforseoClient } from "@/server/lib/dataforseo";
+-import { captureServerEvent } from "@/server/lib/posthog";
+-import { sendCreditsExhaustedEvent } from "@/server/email/onboarding-drip";
+-import { describeError } from "@/server/lib/errors";
+-import { autumn } from "@/server/billing/autumn";
+-import {
+-  AUTUMN_SEO_DATA_BALANCE_FEATURE_ID,
+-  AUTUMN_SEO_DATA_TOPUP_BALANCE_FEATURE_ID,
+-} from "@/shared/billing";
+-import {
+-  estimateRankCheckCredits,
+-  rankCheckCostApprovalError,
+-} from "@/shared/rank-tracking";
+ import { isHostedServerAuthMode } from "@/server/lib/runtime-env";
+-import { isErrorCode } from "@/shared/error-codes";
+ 
+ // These steps cost nothing and are safe to repeat: they touch our own rows,
+ // prepare's Autumn calls only read balances, and its credits email is sent
+@@ -69,6 +45,22 @@ async function prepareRankCheckKeywords(input: {
+ }) {
+   // If stale-cleanup marked our run failed before we got here, bail out
+   // rather than resurrecting a superseded run.
++  const [
++    { RankTrackingRepository },
++    { autumn },
++    { sendCreditsExhaustedEvent },
++    {
++      AUTUMN_SEO_DATA_BALANCE_FEATURE_ID,
++      AUTUMN_SEO_DATA_TOPUP_BALANCE_FEATURE_ID,
++    },
++    { estimateRankCheckCredits, rankCheckCostApprovalError },
++  ] = await Promise.all([
++    import("@/server/features/rank-tracking/repositories/RankTrackingRepository"),
++    import("@/server/billing/autumn"),
++    import("@/server/email/onboarding-drip"),
++    import("@/shared/billing"),
++    import("@/shared/rank-tracking"),
++  ]);
+   const run = await RankTrackingRepository.getRunById(input.runId);
+   if (!run || run.status === "failed" || run.status === "completed") {
+     throw new NonRetryableError(
+@@ -157,6 +149,12 @@ async function finalizeRankCheckRun(input: {
+   // If stale-cleanup already marked our run failed, don't overwrite that
+   // decision with a completed status — a replacement run may already be
+   // underway.
++  const [{ RankTrackingRepository }, { captureServerEvent }, { isErrorCode }] =
++    await Promise.all([
++      import("@/server/features/rank-tracking/repositories/RankTrackingRepository"),
++      import("@/server/lib/posthog"),
++      import("@/shared/error-codes"),
++    ]);
+   const run = await RankTrackingRepository.getRunById(input.runId);
+   if (!run || run.status === "failed" || run.status === "completed") {
+     console.warn(
+@@ -298,6 +296,17 @@ async function markRankCheckRunFailed(input: {
+   // the thrown object, with the message prefixed by the error's name. A
+   // refusal's bare code under that prefix is what the run keeps, so the
+   // credits card shows and the config can say why the check was skipped.
++  const [
++    { failRunIfActive },
++    { RankTrackingRepository },
++    { captureServerEvent },
++    { isErrorCode },
++  ] = await Promise.all([
++    import("@/server/features/rank-tracking/services/rankCheckRunGuards"),
++    import("@/server/features/rank-tracking/repositories/RankTrackingRepository"),
++    import("@/server/lib/posthog"),
++    import("@/shared/error-codes"),
++  ]);
+   const message =
+     input.error instanceof Error ? input.error.message : "Unknown error";
+   const bare = message.replace(/^\w+: /, "");
+@@ -331,6 +340,7 @@ export class RankCheckWorkflow extends WorkflowEntrypoint<
+     // Scope a per-request Postgres client for this workflow invocation (no-op in
+     // D1 mode). The socket is reclaimed when the invocation ends, so there is
+     // nothing to tear down here.
++    const { withPgClient } = await import("@/db");
+     return withPgClient(() => this.runScoped(event, yieldingStep(step)));
+   }
+ 
+@@ -354,6 +364,26 @@ export class RankCheckWorkflow extends WorkflowEntrypoint<
+       maxCostCredits,
+     } = event.payload;
+ 
++    const [
++      { RankTrackingRepository },
++      { failRunIfActive },
++      { pgStep },
++      { createDataforseoClient },
++      { runLiveCheck, runQueuedCheck },
++      { retryRankChecks },
++      { resolveRunGotoUrls },
++      { describeError },
++    ] = await Promise.all([
++      import("@/server/features/rank-tracking/repositories/RankTrackingRepository"),
++      import("@/server/features/rank-tracking/services/rankCheckRunGuards"),
++      import("@/server/workflows/pgStep"),
++      import("@/server/lib/dataforseo"),
++      import("@/server/workflows/rankCheckPaths"),
++      import("@/server/workflows/rankCheckRetries"),
++      import("@/server/workflows/rankCheckGotoUrls"),
++      import("@/server/lib/errors"),
++    ]);
++
+     // Guard: skip if config was archived after the workflow was triggered
+     const configCheck = await pgStep(
+       step,
+diff --git a/src/serverFunctions/samAccess.ts b/src/serverFunctions/samAccess.ts
+index 829f47e..6451741 100644
+--- a/src/serverFunctions/samAccess.ts
++++ b/src/serverFunctions/samAccess.ts
+@@ -1,6 +1,6 @@
+ import { createServerFn } from "@tanstack/react-start";
+ import { z } from "zod";
+-import { getOpenRouterAccess } from "@/server/lib/openrouter";
++import { getOpenRouterAccess } from "@/server/lib/openrouter-impl";
+ import {
+   getWorkersEnv,
+   isHostedServerAuthMode,

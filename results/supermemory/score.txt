@@ -1,0 +1,14 @@
+idle: 1.47 1.96 2.45
+pass 1 base                17.6 ms   runs: 17.4 17.4 17.5 17.6 17.7 18 18.2
+pass 1 agent-alone          7.7 ms   runs: 7.6 7.6 7.6 7.7 7.7 7.8 7.9
+pass 1 with-perf-kit        7.6 ms   runs: 7.3 7.3 7.5 7.6 7.6 8.6 9.5
+pass 2 base                17.9 ms   runs: 17.5 17.5 17.8 17.9 18 18.3 18.7
+pass 2 agent-alone          7.8 ms   runs: 7.7 7.7 7.8 7.8 7.8 7.9 8
+pass 2 with-perf-kit        7.5 ms   runs: 7.3 7.4 7.4 7.5 7.7 7.7 7.7
+pass 3 base                17.6 ms   runs: 17.2 17.6 17.6 17.6 17.7 17.8 18.7
+pass 3 agent-alone          7.7 ms   runs: 7.5 7.6 7.7 7.7 7.7 7.8 7.8
+pass 3 with-perf-kit        7.4 ms   runs: 7.3 7.4 7.4 7.4 7.5 7.6 7.7
+load at end: 2.30 2.13 2.49
+SCORE base 17.6 ms (bundle 6046 KiB)
+SCORE agent-alone 7.7 ms (bundle 2706 KiB)
+SCORE with-perf-kit 7.5 ms (bundle 6058 KiB)

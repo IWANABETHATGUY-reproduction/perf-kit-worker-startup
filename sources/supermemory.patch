@@ -1,0 +1,36 @@
+diff --git a/app/routes/home.tsx b/app/routes/home.tsx
+index 67d32c9..5cdb09e 100644
+--- a/app/routes/home.tsx
++++ b/app/routes/home.tsx
+@@ -4,6 +4,7 @@ import { data, type AppLoadContext } from "react-router"
+ import { commitSession, getSession } from "~/session-cookies.server"
+ import { Welcome } from "../welcome/welcome"
+ import type { Route } from "./+types/home"
++import type { MemoryListResponse } from "@supermemory/sdk/resources/memory.mjs"
+ 
+ export function meta() {
+     return [
+@@ -332,7 +333,7 @@ export default function Home({ loaderData }: Route.ComponentProps) {
+         <Welcome
+             message={loaderData.message}
+             userId={loaderData.userId}
+-            initialMemories={loaderData.memories}
++            initialMemories={loaderData.memories as unknown as MemoryListResponse.Memory[]}
+         />
+     )
+ }
+diff --git a/react-router.config.ts b/react-router.config.ts
+index 5bfea61..1ee720e 100644
+--- a/react-router.config.ts
++++ b/react-router.config.ts
+@@ -3,8 +3,8 @@ import type { Config } from "@react-router/dev/config"
+ export default {
+     ssr: true,
+     future: {
+-        unstable_viteEnvironmentApi: true,
++        v8_viteEnvironmentApi: true,
+         unstable_optimizeDeps: true,
+-        unstable_splitRouteModules: true,
++        v8_splitRouteModules: true,
+     },
+ } satisfies Config

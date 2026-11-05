@@ -1,0 +1,20 @@
+waiting: 5-minute load 4.20 >= 4
+waiting: 5-minute load 4.19 >= 4
+waiting: 5-minute load 4.11 >= 4
+waiting: 5-minute load 4.16 >= 4
+waiting: 5-minute load 4.10 >= 4
+waiting: 5-minute load 4.01 >= 4
+idle: 2.72 3.85 3.54
+pass 1 base                43.6 ms   runs: 43.3 43.4 43.6 43.6 44.2 44.9 53.6
+pass 1 agent-alone         13.1 ms   runs: 12.8 12.9 13 13.1 13.1 13.1 13.2
+pass 1 with-perf-kit        0.4 ms   runs: 0.4 0.4 0.4 0.4 0.4 0.4 0.6
+pass 2 base                44.8 ms   runs: 43.6 43.7 43.9 44.8 44.9 44.9 48
+pass 2 agent-alone         13.1 ms   runs: 12.8 12.9 13 13.1 13.2 13.2 13.9
+pass 2 with-perf-kit        0.4 ms   runs: 0.3 0.4 0.4 0.4 0.4 0.4 0.6
+pass 3 base                44.2 ms   runs: 43.7 43.9 43.9 44.2 44.3 44.3 46
+pass 3 agent-alone         13.2 ms   runs: 12.9 13 13.1 13.2 13.4 13.4 13.5
+pass 3 with-perf-kit        0.4 ms   runs: 0.3 0.3 0.4 0.4 0.4 0.4 0.4
+load at end: 2.45 3.63 3.47
+SCORE base 44.2 ms (bundle 18230 KiB)
+SCORE agent-alone 13.1 ms (bundle 10601 KiB)
+SCORE with-perf-kit 0.4 ms (bundle 18243 KiB)
